@@ -80,4 +80,111 @@ impl Provider for KiroProvider {
                 ..Default::default()
             })
     }
+
+    fn normalize_account<'a>(
+        &'a self,
+        _ctx: &'a agent2api_provider_sdk::PluginCtx,
+        input: proto::NormalizeInput,
+    ) -> agent2api_provider_sdk::SendFuture<'a, proto::NormalizedAccount> {
+        Box::pin(async move {
+            let payload = match &input.source {
+                proto::NormalizeSource::Manual { payload } => payload.clone(),
+                proto::NormalizeSource::FileText { content, .. } => serde_json::from_str::<serde_json::Value>(content)
+                    .map_err(|e| format!("文件不是合法 JSON: {e}"))?,
+                proto::NormalizeSource::FileBase64 { .. } => {
+                    return Err("Kiro 不支持二进制文件导入".to_string())
+                }
+                proto::NormalizeSource::Desktop => {
+                    return Err("Kiro 不支持读取本机客户端登录态".to_string())
+                }
+            };
+            let raw = payload
+                .get("apiKey")
+                .or_else(|| payload.get("token"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let cred = auth::parse_api_key(raw)?;
+            let identity = auth::identity_of(&cred);
+            Ok(proto::NormalizedAccount {
+                secret: serde_json::json!({
+                    "accessToken": cred.access_token,
+                    "apiKey": cred.api_key,
+                    "region": cred.region,
+                    "kind": "api_key",
+                }),
+                public: serde_json::json!({
+                    "name": input.name.clone().unwrap_or_else(|| "Kiro".to_string()),
+                    "email": identity,
+                    "tokenTail": tail_of(&cred.access_token),
+                    "hasToken": true,
+                }),
+                identity,
+                desktop: false,
+            })
+        })
+    }
+
+    fn account_identity(&self, secret: &serde_json::Value) -> Result<String, String> {
+        let cred = credential_from_secret(secret)?;
+        Ok(auth::identity_of(&cred))
+    }
+
+    fn ensure_token<'a>(
+        &'a self,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        account: &'a str,
+    ) -> agent2api_provider_sdk::SendFuture<'a, String> {
+        Box::pin(async move {
+            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = credential_from_secret(&stored.secret)?;
+            Ok(cred.access_token)
+        })
+    }
+
+    fn token_expiring<'a>(
+        &'a self,
+        _ctx: &'a agent2api_provider_sdk::PluginCtx,
+        _account: &'a str,
+    ) -> agent2api_provider_sdk::SendFuture<'a, bool> {
+        // 判不出来就 false：宁可漏刷，也不要凭猜测打上游。
+        Box::pin(async move { Ok(false) })
+    }
+}
+
+/// 从落盘 secret 还原凭证。
+fn credential_from_secret(secret: &serde_json::Value) -> Result<auth::KiroCredential, String> {
+    let token = secret
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if token.is_empty() {
+        return Err("账号里没有 Kiro 令牌，请重新添加".to_string());
+    }
+    let region = secret
+        .get("region")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(endpoints::DEFAULT_REGION)
+        .to_string();
+    Ok(auth::KiroCredential {
+        access_token: token.to_string(),
+        api_key: secret
+            .get("apiKey")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(token)
+            .to_string(),
+        refresh_token: secret
+            .get("refreshToken")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        region,
+        kind: auth::CredentialKind::ApiKey,
+    })
+}
+
+/// 令牌尾部四位（界面显示用，绝不回显本体）。
+fn tail_of(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect()
 }
