@@ -159,6 +159,59 @@ impl Provider for KiroProvider {
         Box::pin(async move { run_chat(ctx, req, sink).await })
     }
 
+    fn models<'a>(
+        &'a self,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        account: &'a str,
+    ) -> agent2api_provider_sdk::SendFuture<'a, proto::ModelList> {
+        Box::pin(async move {
+            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = credential_from_secret(&stored.secret)?;
+            let client = crate::http::client(None, "");
+            match models::fetch_all(&client, &cred).await {
+                Ok(list) if !list.is_empty() => Ok(proto::ModelList {
+                    models: list,
+                    meta: proto::CatalogMeta {
+                        remote: true,
+                        refreshed_at: crate::http::now_ms(),
+                    },
+                }),
+                _ => Ok(proto::ModelList {
+                    models: default_models(),
+                    meta: proto::CatalogMeta { remote: false, refreshed_at: 0 },
+                }),
+            }
+        })
+    }
+
+    fn refresh_models<'a>(
+        &'a self,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        account: &'a str,
+        _force: bool,
+    ) -> agent2api_provider_sdk::SendFuture<'a, proto::RefreshOutcome> {
+        Box::pin(async move {
+            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = credential_from_secret(&stored.secret)?;
+            let client = crate::http::client(None, "");
+            let list = models::fetch_all(&client, &cred).await?;
+            Ok(proto::RefreshOutcome::refreshed(list.len()))
+        })
+    }
+
+    fn usage<'a>(
+        &'a self,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        account: &'a str,
+    ) -> agent2api_provider_sdk::SendFuture<'a, proto::UsageReport> {
+        Box::pin(async move {
+            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = credential_from_secret(&stored.secret)?;
+            let client = crate::http::client(None, "");
+            usage::fetch(&client, &cred).await
+        })
+    }
+
     fn classify(&self, status: u16, body: &serde_json::Value) -> proto::ErrorClass {
         let message = body
             .get("message")
