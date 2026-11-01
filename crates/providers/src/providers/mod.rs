@@ -36,6 +36,8 @@ pub mod cline;
 pub mod commandcode;
 #[cfg(feature = "demo")]
 pub mod demo;
+#[cfg(feature = "kiro")]
+pub mod kiro;
 #[cfg(feature = "kuku")]
 pub mod kuku;
 #[cfg(feature = "lobsterai")]
@@ -168,6 +170,11 @@ pub fn registry() -> Vec<BoxProvider> {
     list.push(Box::new(codearts::adapter::CODEARTS));
     #[cfg(feature = "antigravity")]
     list.push(Box::new(antigravity::adapter::ANTIGRAVITY));
+
+    #[cfg(feature = "kiro")]
+    {
+        list.push(Box::new(kiro::KiroProvider));
+    }
 
     list
 }

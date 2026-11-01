@@ -1,7 +1,7 @@
 {
   "id": "agent2api-providers",
   "name": "Agent2API 官方提供商",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "protocol": 1,
   "providers": [
     {
@@ -182,6 +182,12 @@
       "id": "antigravity",
       "label": "Antigravity",
       "order": 29,
+      "default_enabled": true
+    },
+    {
+      "id": "kiro",
+      "label": "Kiro",
+      "order": 22,
       "default_enabled": true
     }
   ],

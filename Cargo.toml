@@ -10,7 +10,7 @@ members = ["crates/providers", "crates/provider-protocol", "crates/provider-sdk"
 # 三个 crate 的分工：
 #   crates/provider-protocol  线上类型（契约）—— 网关与插件共同编译
 #   crates/provider-sdk       Provider trait 与 serve() 主循环（给第三方用）
-#   crates/providers          21 家内置实现 —— 编译成插件二进制
+#   crates/providers          22 家内置实现 —— 编译成插件二进制
 #
 # ── 为什么契约库也放在这个仓库 ───────────────────────────────
 # 曾经考虑单独一个仓库（让网关和插件各引用一份），但那样改协议要在两个
@@ -28,7 +28,7 @@ members = ["crates/providers", "crates/provider-protocol", "crates/provider-sdk"
 # 版本号永久占用的约束。
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.88"
 license-file = "LICENSE"
