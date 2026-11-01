@@ -51,6 +51,12 @@ pub struct KiroCredential {
     pub region: String,
     /// 凭证种类。
     pub kind: CredentialKind,
+    /// OIDC `clientId`（设备授权登录注册的那一份；续期必须同一个）。
+    pub client_id: Option<String>,
+    /// OIDC `clientSecret`（同上）。缺它时续期走 Kiro 原生端点。
+    pub client_secret: Option<String>,
+    /// access token 过期时刻（毫秒时间戳）；`None` = 不知道。
+    pub expires_at: Option<i64>,
 }
 
 /// 解析用户粘贴的 API Key（`ksk_…` 或 `ksk_…|region`）。
@@ -79,6 +85,9 @@ pub fn parse_api_key(raw: &str) -> Result<KiroCredential, String> {
             region.to_string()
         },
         kind: CredentialKind::ApiKey,
+        client_id: None,
+        client_secret: None,
+        expires_at: None,
     })
 }
 
@@ -228,6 +237,9 @@ pub async fn poll_device(
             refresh_token: (!refresh.is_empty()).then(|| refresh.to_string()),
             region: region.to_string(),
             kind: CredentialKind::OAuth,
+            client_id: Some(client_id.to_string()),
+            client_secret: Some(client_secret.to_string()),
+            expires_at: expires_at_of(&payload),
         }));
     }
     let error = payload.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -239,35 +251,76 @@ pub async fn poll_device(
     Err(format!("Kiro 授权失败：{error}"))
 }
 
+/// Kiro 原生续期端点（**没有** `clientSecret` 时用它）。
+///
+/// ── 为什么需要这条兜底 ──────────────────────────────────────
+/// 设备授权登录注册出来的是 AWS OIDC 客户端：`/token` 必须 `clientId` 与
+/// `clientSecret` **成对**出现，缺一个就是 `invalid_client`。而手动导入
+/// 凭据、或登录流程状态丢失后只剩 refreshToken 的账号拿不到 clientSecret
+/// —— 那条路以前恒失败。Kiro 桌面端自己的续期端点只认 refreshToken，正好
+/// 补上这一档（与 kiro2cc-proxy / Kiro-Go 同一条口径）。
+pub const NATIVE_REFRESH_URL: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
+
+/// 有 `clientSecret` 就走 OIDC `/token`；`None` = 走 [`NATIVE_REFRESH_URL`]。
+fn oidc_refresh_url(cred: &KiroCredential) -> Option<String> {
+    cred.client_secret
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| format!("{}/token", oidc_base(&cred.region)))
+}
+
 /// 用 refresh token 换新 access token。
 ///
 /// ── 为什么手拼表单体（而不是用 `http::post_form`）───────────
 /// 这里要复用调用方给的 client（登录 / 续期共用一份出口），并且要把
 /// [`urlencode`] 的编码结果原样发出去；`post_form` 走 `reqwest` 的 `.form()`
 /// 编码，重复编码会让 refresh token 里的 `+` `/` `=` 变形。
+///
+/// ── 两条端点（见 [`oidc_refresh_url`]）──────────────────────
+/// OIDC 那条发表单（AWS 的 `/token` 只认 `application/x-www-form-urlencoded`）；
+/// 原生那条发 JSON（Kiro 桌面端客户端就是这么发的）。
 pub async fn refresh(
     client: &reqwest::Client,
     cred: &KiroCredential,
 ) -> Result<KiroCredential, String> {
-    let Some(refresh_token) = cred.refresh_token.as_deref() else {
+    let Some(refresh_token) = cred
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    else {
         return Err("这个 Kiro 账号没有 refresh token，无法续期".to_string());
     };
-    let url = format!("{}/token", oidc_base(&cred.region));
-    let form = [
-        ("clientId", "kiro"),
-        ("grantType", "refresh_token"),
-        ("refreshToken", refresh_token),
-    ];
-    let body: String = form
-        .iter()
-        .map(|(key, value)| format!("{key}={}", urlencode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    let response = client
-        .post(&url)
-        .header("Accept", "application/json")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(body)
+    let (url, body, is_form) = match oidc_refresh_url(cred) {
+        Some(url) => {
+            let client_id = cred
+                .client_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("kiro");
+            let client_secret = cred.client_secret.as_deref().unwrap_or("");
+            let form = [
+                ("clientId", client_id),
+                ("clientSecret", client_secret),
+                ("grantType", "refresh_token"),
+                ("refreshToken", refresh_token),
+            ];
+            (url, encode_form(&form), true)
+        }
+        None => (
+            NATIVE_REFRESH_URL.to_string(),
+            serde_json::json!({ "refreshToken": refresh_token }).to_string(),
+            false,
+        ),
+    };
+    let request = client.post(&url).header("Accept", "application/json");
+    let request = if is_form {
+        request
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+    } else {
+        request.header("content-type", "application/json").body(body)
+    };
+    let response = request
         .send()
         .await
         .map_err(|error| crate::http::describe(&error))?;
@@ -293,7 +346,49 @@ pub async fn refresh(
             .or_else(|| cred.refresh_token.clone()),
         region: cred.region.clone(),
         kind: CredentialKind::OAuth,
+        client_id: cred.client_id.clone(),
+        client_secret: cred.client_secret.clone(),
+        expires_at: expires_at_of(&payload),
     })
+}
+
+/// 令牌响应 → 过期时刻（毫秒时间戳）。
+///
+/// ── 为什么要换算而不是原样存 ────────────────────────────────
+/// AWS 的 `/token` 只给 `expiresIn`（**秒**，相对值），而账号记录与界面要的
+/// 是绝对时刻（`expiresAt`，毫秒）—— 直接存相对值会让「临期判断」随着
+/// 时间流逝永远成立。绝对时刻也已经是现成字段（`expiresAt`，兼容秒级输入）。
+pub fn expires_at_of(payload: &Value) -> Option<i64> {
+    for key in ["expiresIn", "expires_in"] {
+        if let Some(seconds) = payload
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+        {
+            return Some(crate::http::now_ms() + seconds * 1000);
+        }
+    }
+    payload
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .map(|value| {
+            // 秒级时间戳（< 2001 年的毫秒值）补成毫秒，两种输入都认。
+            if value < 1_000_000_000_000 {
+                value * 1000
+            } else {
+                value
+            }
+        })
+}
+
+/// 表单体编码（`application/x-www-form-urlencoded`）。
+fn encode_form(fields: &[(&str, &str)]) -> String {
+    fields
+        .iter()
+        .map(|(key, value)| format!("{key}={}", urlencode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// 最小表单编码（`application/x-www-form-urlencoded` 的 unreserved 集合）。
@@ -378,6 +473,9 @@ mod tests {
             refresh_token: refresh.map(str::to_string),
             region: "us-east-1".to_string(),
             kind: CredentialKind::OAuth,
+            client_id: None,
+            client_secret: None,
+            expires_at: None,
         }
     }
 
@@ -389,12 +487,49 @@ mod tests {
             refresh_token: Some("rt".into()),
             region: "us-east-1".into(),
             kind: CredentialKind::OAuth,
+            client_id: Some("cid".into()),
+            client_secret: Some("csecret".into()),
+            expires_at: None,
         };
         assert!(crate::providers::kiro::endpoints::chat_url(&cred)
             .contains("q.us-east-1.amazonaws.com"));
         assert!(auth_headers(&cred)
             .iter()
             .all(|(key, _)| key != "tokentype"));
+    }
+
+    #[test]
+    fn refresh_uses_oidc_only_when_client_secret_is_known() {
+        let mut cred = oauth("at", Some("rt"));
+        // 没有 clientSecret（手动导入 / 流程状态丢失）→ Kiro 原生端点
+        assert_eq!(oidc_refresh_url(&cred), None);
+        cred.client_id = Some("cid".into());
+        cred.client_secret = Some("csecret".into());
+        assert_eq!(
+            oidc_refresh_url(&cred).as_deref(),
+            Some("https://oidc.us-east-1.amazonaws.com/token")
+        );
+        // 空串等同于没有
+        cred.client_secret = Some("   ".into());
+        assert_eq!(oidc_refresh_url(&cred), None);
+    }
+
+    #[test]
+    fn expires_in_is_converted_to_absolute_milliseconds() {
+        let before = crate::http::now_ms();
+        let expires = expires_at_of(&serde_json::json!({ "expiresIn": 3600 })).expect("应能换算");
+        assert!(expires >= before + 3_600_000, "应是绝对毫秒时刻：{expires}");
+        // 已经是绝对毫秒时原样返回；秒级输入补成毫秒
+        assert_eq!(
+            expires_at_of(&serde_json::json!({ "expiresAt": 1_900_000_000_000_i64 })),
+            Some(1_900_000_000_000_i64)
+        );
+        assert_eq!(
+            expires_at_of(&serde_json::json!({ "expiresAt": 1_900_000_000_i64 })),
+            Some(1_900_000_000_000_i64)
+        );
+        // 判不出来就不编
+        assert_eq!(expires_at_of(&serde_json::json!({})), None);
     }
 
     #[test]

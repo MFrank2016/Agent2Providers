@@ -30,6 +30,8 @@ pub struct FrameTranslator {
     index: u64,
     pending: Option<PendingTool>,
     finished: bool,
+    /// 这一轮是否已经产出过 `tool_calls` 增量（收尾帧据此选 finish_reason）。
+    emitted_tool_call: bool,
 }
 
 impl FrameTranslator {
@@ -41,6 +43,22 @@ impl FrameTranslator {
             index: 0,
             pending: None,
             finished: false,
+            emitted_tool_call: false,
+        }
+    }
+
+    /// 这一轮的 `finish_reason`：出现过工具调用就是 `tool_calls`。
+    ///
+    /// ── 为什么不能恒给 `stop` ──────────────────────────────────
+    /// 客户端（以及网关的聚合器）靠它决定「还要不要继续跑工具」。工具轮报
+    /// `stop` 等于告诉客户端「这轮结束了，没有调用」—— 于是 `tool_calls`
+    /// 增量被丢弃，模型被要求继续输出却又拿不到结果，表现为「反复读同一个
+    /// 文件」或干脆停住。
+    fn finish_reason(&self) -> &'static str {
+        if self.emitted_tool_call {
+            "tool_calls"
+        } else {
+            "stop"
         }
     }
 
@@ -69,7 +87,7 @@ impl FrameTranslator {
             "messageMetadataEvent" => {
                 self.finished = true;
                 let usage = payload.get("tokenUsage").cloned().unwrap_or(Value::Null);
-                vec![self.finish_frame("stop", &usage)]
+                vec![self.finish_frame(self.finish_reason(), &usage)]
             }
             _ => Vec::new(),
         }
@@ -83,7 +101,7 @@ impl FrameTranslator {
         }
         if !self.finished {
             self.finished = true;
-            frames.push(self.finish_frame("stop", &Value::Null));
+            frames.push(self.finish_frame(self.finish_reason(), &Value::Null));
         }
         frames.push("data: [DONE]\n\n".to_string());
         frames
@@ -128,6 +146,7 @@ impl FrameTranslator {
         };
         let index = self.index;
         self.index += 1;
+        self.emitted_tool_call = true;
         sse(&json!({
             "id": self.id,
             "object": "chat.completion.chunk",
@@ -271,6 +290,35 @@ mod tests {
         assert!(frames[0].contains(r#""tool_calls""#));
         assert!(frames[0].contains(r#""name":"read_file""#));
         assert!(frames[0].contains("a.txt"));
+    }
+
+    #[test]
+    fn tool_turn_finishes_with_tool_calls_reason() {
+        // 工具轮的收尾帧必须说 `tool_calls`：报 `stop` 会让客户端丢掉调用、
+        // 不再回灌结果，模型于是反复做同一件事。
+        let mut translator = FrameTranslator::new("m");
+        let frames = translator.feed(&frame(
+            "toolUseEvent",
+            r#"{"toolUseId":"t1","name":"read_file","input":"{}","stop":true}"#,
+        ));
+        assert!(frames[0].contains(r#""tool_calls""#));
+        let finish = translator.feed(&frame("messageMetadataEvent", "{}"));
+        assert_eq!(finish.len(), 1);
+        assert!(
+            finish[0].contains(r#""finish_reason":"tool_calls""#),
+            "工具轮收尾帧应是 tool_calls：{}",
+            finish[0]
+        );
+        // 同一轮里没收到 metadata 时，`finish()` 兜底的收尾帧也一样。
+        let mut second = FrameTranslator::new("m");
+        let _ = second.feed(&frame(
+            "toolUseEvent",
+            r#"{"toolUseId":"t2","name":"read_file","input":"{}","stop":true}"#,
+        ));
+        let tail = second.finish();
+        assert!(tail
+            .iter()
+            .any(|frame| frame.contains(r#""finish_reason":"tool_calls""#)));
     }
 
     #[test]

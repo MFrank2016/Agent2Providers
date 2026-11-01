@@ -191,6 +191,16 @@ pub fn build(body: &Value, model: &str, profile_arn: Option<&str>) -> Result<Val
     //    currentMessage 只承载用户本轮指令，结果放在紧随 assistant 的 user turn 里，
     //    上游只校验 toolUseId 是否真实存在，不要求结果在 currentMessage。
     let mut current = turns.pop().ok_or_else(|| "messages 为空".to_string())?;
+    // ── 末尾是 assistant 时它**不是**本轮指令 ────────────────────
+    // 客户端可能把上一轮答复也带回来（预填充 / 重放历史 / 只有 assistant
+    // 的摘要），此时无条件 `pop()` 会把它当 `currentMessage`：上游收到的
+    // 「用户这句话」其实是它自己的答复，而那条 assistant 轮里的 `tool_calls`
+    // 也一起丢了（历史里没有它，工具结果又对不上 → 全部降级成文本）。
+    // 正确处置：推回 history，`currentMessage` 用官方客户端的 `Continue` 兜底。
+    if !current.is_user {
+        turns.push(current);
+        current = Turn::user(CONTINUE_PADDING.to_string());
+    }
     if !trailing_tools
         && current.is_user
         && (!current.tool_results.is_empty() || !current.degraded.is_empty())
@@ -472,6 +482,37 @@ mod tests {
         assert!(history[1].get("assistantResponseMessage").is_some());
         let current = &wire["conversationState"]["currentMessage"]["userInputMessage"]["content"];
         assert_eq!(current, "第二轮");
+    }
+
+    #[test]
+    fn trailing_assistant_turn_goes_to_history_and_current_uses_continue() {
+        // 末尾是 assistant（客户端把上一轮答复一起带回来了）：它不是本轮指令，
+        // 必须进 history —— 否则它的 tool_calls 会整条丢掉。
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "读一下 a.txt" },
+                { "role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" }
+                }]}
+            ]
+        });
+        let wire = build(&body, "m", None).expect("应能构造");
+        let history = wire["conversationState"]["history"]
+            .as_array()
+            .expect("应有 history");
+        // 起点补 padding user，末尾是那条 assistant（toolUses 保留）
+        assert!(history.len() >= 2, "history 至少含 padding + assistant");
+        let last = history.last().expect("应有末轮");
+        let uses = last["assistantResponseMessage"]["toolUses"]
+            .as_array()
+            .expect("assistant 轮的工具调用不能丢");
+        assert_eq!(uses[0]["toolUseId"], "call_1");
+        assert_eq!(
+            wire["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+            CONTINUE_PADDING
+        );
     }
 
     #[test]

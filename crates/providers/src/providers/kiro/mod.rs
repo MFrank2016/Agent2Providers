@@ -159,8 +159,8 @@ impl Provider for KiroProvider {
         account: &'a str,
     ) -> agent2api_provider_sdk::SendFuture<'a, String> {
         Box::pin(async move {
-            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
-            let cred = usable_credential(ctx, &stored).await?;
+            let mut stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = usable_credential(ctx, &mut stored).await?;
             Ok(cred.access_token)
         })
     }
@@ -175,23 +175,35 @@ impl Provider for KiroProvider {
         account: &'a str,
     ) -> agent2api_provider_sdk::SendFuture<'a, String> {
         Box::pin(async move {
-            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let mut stored = ctx.store_get(ID, account).await.map_err(String::from)?;
             let cred = credential_from_secret(&stored.secret)?;
             if cred.kind != auth::CredentialKind::OAuth {
                 return Err("Kiro API Key 不续期：请重新添加账号".to_string());
             }
-            let next = refresh_and_persist(ctx, &stored, &cred).await?;
+            let next = refresh_and_persist(ctx, &mut stored, &cred).await?;
             Ok(next.access_token)
         })
     }
 
+    /// 是否临期（后台维护据此提前续期）。
+    ///
+    /// ── 判据为什么是 `expiresAt` ────────────────────────────────
+    /// 登录 / 续期的令牌响应里都有 `expiresIn`（秒），[`auth::expires_at_of`]
+    /// 把它换算成绝对毫秒时刻写进 secret。判不出来（老记录、手动只导入了
+    /// refreshToken）才返回 `false`：宁可漏刷，也不要凭猜测打上游。
     fn token_expiring<'a>(
         &'a self,
-        _ctx: &'a agent2api_provider_sdk::PluginCtx,
-        _account: &'a str,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        account: &'a str,
     ) -> agent2api_provider_sdk::SendFuture<'a, bool> {
-        // 判不出来就 false：宁可漏刷，也不要凭猜测打上游。
-        Box::pin(async move { Ok(false) })
+        Box::pin(async move {
+            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let expires_at = stored
+                .secret
+                .get("expiresAt")
+                .and_then(serde_json::Value::as_i64);
+            Ok(is_expiring(expires_at, crate::http::now_ms()))
+        })
     }
 
     fn conversation<'a>(
@@ -209,8 +221,8 @@ impl Provider for KiroProvider {
         account: &'a str,
     ) -> agent2api_provider_sdk::SendFuture<'a, proto::ModelList> {
         Box::pin(async move {
-            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
-            let cred = usable_credential(ctx, &stored).await?;
+            let mut stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = usable_credential(ctx, &mut stored).await?;
             let client = crate::http::client(None, "");
             match models::fetch_all(&client, &cred).await {
                 Ok(list) if !list.is_empty() => Ok(proto::ModelList {
@@ -235,8 +247,8 @@ impl Provider for KiroProvider {
         _force: bool,
     ) -> agent2api_provider_sdk::SendFuture<'a, proto::RefreshOutcome> {
         Box::pin(async move {
-            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
-            let cred = usable_credential(ctx, &stored).await?;
+            let mut stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = usable_credential(ctx, &mut stored).await?;
             let client = crate::http::client(None, "");
             let list = models::fetch_all(&client, &cred).await?;
             Ok(proto::RefreshOutcome::refreshed(list.len()))
@@ -249,8 +261,8 @@ impl Provider for KiroProvider {
         account: &'a str,
     ) -> agent2api_provider_sdk::SendFuture<'a, proto::UsageReport> {
         Box::pin(async move {
-            let stored = ctx.store_get(ID, account).await.map_err(String::from)?;
-            let cred = usable_credential(ctx, &stored).await?;
+            let mut stored = ctx.store_get(ID, account).await.map_err(String::from)?;
+            let cred = usable_credential(ctx, &mut stored).await?;
             let client = crate::http::client(None, "");
             usage::fetch(&client, &cred).await
         })
@@ -452,6 +464,14 @@ impl Provider for KiroProvider {
     }
 }
 
+/// 距过期不足这个窗口就算「临期」（后台维护会提前续期）。
+const EXPIRY_WINDOW_MS: i64 = 5 * 60 * 1000;
+
+/// 过期时刻（毫秒）是否落在临期窗口内；`None` = 判不出来 = 不算临期。
+fn is_expiring(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_some_and(|expires| expires - now <= EXPIRY_WINDOW_MS)
+}
+
 /// 从落盘 secret 还原凭证。
 ///
 /// ── `kind` 为什么必须读出来 ────────────────────────────────
@@ -499,6 +519,17 @@ fn credential_from_secret(secret: &serde_json::Value) -> Result<auth::KiroCreden
         refresh_token,
         region,
         kind,
+        client_id: secret
+            .get("clientId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        client_secret: secret
+            .get("clientSecret")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        expires_at: secret.get("expiresAt").and_then(serde_json::Value::as_i64),
     })
 }
 
@@ -508,21 +539,42 @@ fn flow_key(flow: &str) -> String {
 }
 
 /// OAuth 凭证 → 网关落库形态（登录成功时用）。
+///
+/// ── 为什么要把 `clientId` / `clientSecret` 一起存 ────────────
+/// 设备授权注册出来的 OIDC 客户端是**续期的前提**：AWS 的 `/token` 要求
+/// `clientId` + `clientSecret` 成对出现。以前只存了令牌，续期时拿一个
+/// 写死的 `clientId="kiro"` 去打，必然 `invalid_client` —— 也就是「登录能
+/// 成功、过一小时就再也不能用」。
 fn oauth_account_of(cred: &auth::KiroCredential) -> proto::NormalizedAccount {
     let identity = auth::identity_of(cred);
+    let mut secret = serde_json::Map::new();
+    secret.insert("accessToken".into(), serde_json::json!(cred.access_token));
+    secret.insert("refreshToken".into(), serde_json::json!(cred.refresh_token));
+    secret.insert("region".into(), serde_json::json!(cred.region));
+    secret.insert("kind".into(), serde_json::json!("oauth"));
+    if let Some(client_id) = &cred.client_id {
+        secret.insert("clientId".into(), serde_json::json!(client_id));
+    }
+    if let Some(client_secret) = &cred.client_secret {
+        secret.insert("clientSecret".into(), serde_json::json!(client_secret));
+    }
+    let mut public = serde_json::Map::new();
+    public.insert("name".into(), serde_json::json!("Kiro"));
+    public.insert("email".into(), serde_json::json!(identity.clone()));
+    public.insert(
+        "tokenTail".into(),
+        serde_json::json!(tail_of(&cred.access_token)),
+    );
+    public.insert("hasToken".into(), serde_json::json!(true));
+    // `expiresAt` 落在**公开视图**（界面按 `account_features.expiry` 读它），
+    // 同时也进 secret（`token_expiring` 与续期要用）。
+    if let Some(expires_at) = cred.expires_at {
+        secret.insert("expiresAt".into(), serde_json::json!(expires_at));
+        public.insert("expiresAt".into(), serde_json::json!(expires_at));
+    }
     proto::NormalizedAccount {
-        secret: serde_json::json!({
-            "accessToken": cred.access_token,
-            "refreshToken": cred.refresh_token,
-            "region": cred.region,
-            "kind": "oauth",
-        }),
-        public: serde_json::json!({
-            "name": "Kiro",
-            "email": identity,
-            "tokenTail": tail_of(&cred.access_token),
-            "hasToken": true,
-        }),
+        secret: serde_json::Value::Object(secret),
+        public: serde_json::Value::Object(public),
         identity,
         desktop: false,
     }
@@ -566,35 +618,69 @@ fn oauth_account_of_payload(
         refresh_token: (!refresh.is_empty()).then(|| refresh.clone()),
         region: region.clone(),
         kind: auth::CredentialKind::OAuth,
+        // `~/.aws/sso/cache/*.json` 本身就带这两个；手动粘贴时不带也能用
+        // （续期会落到 Kiro 原生端点，见 auth::oidc_refresh_url）。
+        client_id: optional_text(&payload, "clientId"),
+        client_secret: optional_text(&payload, "clientSecret"),
+        expires_at: auth::expires_at_of(&payload),
     };
     let identity = auth::identity_of(&cred);
+    let mut secret = serde_json::Map::new();
+    secret.insert("accessToken".into(), serde_json::json!(access));
+    secret.insert(
+        "refreshToken".into(),
+        serde_json::json!((!refresh.is_empty()).then(|| refresh.clone())),
+    );
+    secret.insert("region".into(), serde_json::json!(region));
+    secret.insert("kind".into(), serde_json::json!("oauth"));
+    if let Some(client_id) = &cred.client_id {
+        secret.insert("clientId".into(), serde_json::json!(client_id));
+    }
+    if let Some(client_secret) = &cred.client_secret {
+        secret.insert("clientSecret".into(), serde_json::json!(client_secret));
+    }
+    let mut public = serde_json::Map::new();
+    public.insert(
+        "name".into(),
+        serde_json::json!(name.unwrap_or_else(|| "Kiro".to_string())),
+    );
+    public.insert("email".into(), serde_json::json!(identity.clone()));
+    public.insert(
+        "tokenTail".into(),
+        serde_json::json!(tail_of(&cred.access_token)),
+    );
+    public.insert("hasToken".into(), serde_json::json!(true));
+    if let Some(expires_at) = cred.expires_at {
+        secret.insert("expiresAt".into(), serde_json::json!(expires_at));
+        public.insert("expiresAt".into(), serde_json::json!(expires_at));
+    }
     Ok(proto::NormalizedAccount {
-        secret: serde_json::json!({
-            "accessToken": access,
-            "refreshToken": (!refresh.is_empty()).then(|| refresh.clone()),
-            "region": region,
-            "kind": "oauth",
-        }),
-        public: serde_json::json!({
-            "name": name.unwrap_or_else(|| "Kiro".to_string()),
-            "email": identity,
-            "tokenTail": tail_of(&access),
-            "hasToken": true,
-        }),
+        secret: serde_json::Value::Object(secret),
+        public: serde_json::Value::Object(public),
         identity,
         desktop: false,
     })
 }
 
+/// payload 里某个可选的非空字符串字段。
+fn optional_text(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// 一份「现在就能用」的凭证：OAuth 账号 access token 为空时先换一次。
 ///
 /// ── 为什么只在空的时候换 ────────────────────────────────────
-/// 本家没有存 `expiresAt`（AWS 的 `/token` 只给 `expiresIn`），判不出临期；
-/// 「过期但非空」的令牌交给上游 401 → 网关调 [`refresh_token`] 那条既有链路。
-/// 空令牌则连一次请求都发不出去，只能在这里先换。
+/// 非空但可能已过期的令牌交给上游 401 → [`run_chat`] 的「续期 + 重试」；
+/// 后台维护则按 secret 里的 `expiresAt` 提前刷（见 `token_expiring`）。
+/// 空令牌连一次请求都发不出去，只能在这里先换。
 async fn usable_credential(
     ctx: &agent2api_provider_sdk::PluginCtx,
-    stored: &agent2api_provider_sdk::StoreAccount,
+    stored: &mut agent2api_provider_sdk::StoreAccount,
 ) -> Result<auth::KiroCredential, String> {
     let cred = credential_from_secret(&stored.secret)?;
     if cred.kind == auth::CredentialKind::OAuth && cred.access_token.is_empty() {
@@ -604,9 +690,15 @@ async fn usable_credential(
 }
 
 /// 续期并尽力写回（写回失败不阻断：手里这份令牌仍然可用）。
+///
+/// ── 为什么要顺手更新 `stored.secret` ─────────────────────────
+/// 调用方紧接着可能还要再写一次（例如 401 重试、profileArn 缓存）。条件
+/// 写回的 `expect` 是「我读到的那份」，本地不跟着更新就会在第二次写回时
+/// 恒失败 —— 而失败是静默的（只返回 `false`），症状是「续期成功但下次又
+/// 拿旧令牌」。
 async fn refresh_and_persist(
     ctx: &agent2api_provider_sdk::PluginCtx,
-    stored: &agent2api_provider_sdk::StoreAccount,
+    stored: &mut agent2api_provider_sdk::StoreAccount,
     cred: &auth::KiroCredential,
 ) -> Result<auth::KiroCredential, String> {
     let client = crate::http::client(None, &ctx.env.proxy);
@@ -619,9 +711,13 @@ async fn refresh_and_persist(
     if let Some(token) = &next.refresh_token {
         fields.push(("refreshToken", serde_json::json!(token)));
     }
+    if let Some(expires_at) = next.expires_at {
+        fields.push(("expiresAt", serde_json::json!(expires_at)));
+    }
     let secret = crate::store::with_fields(&stored.secret, &fields);
     // `false` = 另一个刷新先落盘了（值已变）。那不是错误 —— 本份仍可用。
     let _ = ctx.store_update(&stored.id, &stored.secret, &secret).await;
+    stored.secret = secret;
     Ok(next)
 }
 
@@ -638,11 +734,11 @@ async fn run_chat(
     req: proto::ConversationRequest,
     mut sink: agent2api_provider_sdk::ConversationSink<'_>,
 ) -> Result<(), String> {
-    let account = ctx
+    let mut stored = ctx
         .store_get(ID, &req.account)
         .await
         .map_err(String::from)?;
-    let cred = usable_credential(ctx, &account).await?;
+    let mut cred = usable_credential(ctx, &mut stored).await?;
     let client_model = req
         .body
         .get("model")
@@ -655,33 +751,52 @@ async fn run_chat(
         req.wire_model.clone()
     };
 
-    let client = crate::http::client(req.proxy.as_ref(), "");
+    // ── 流式必须用 `stream_client` ──────────────────────────────
+    // 控制面客户端带着 20 秒**总超时**（reqwest 的 timeout 覆盖整个响应体），
+    // 长回答会在第 20 秒被硬掐断。`stream_client` 只限建连与读空闲。
+    let client = crate::http::stream_client(req.proxy.as_ref(), "");
     // ── profileArn 只对 OAuth 账号有意义 ────────────────────────
     // API Key（Kiro CLI）走 runtime 主机，请求体里不带 profileArn；OAuth 走
     // `q.{region}`，部分账号缺这个字段会 400。拿不到就给 `None` ——
     // best-effort，绝不因为「查不到 profile」把整条对话判失败。
+    // 取到一次就写进 secret 复用，免得每个对话请求都多打一次上游。
     let profile_arn = match cred.kind {
-        auth::CredentialKind::OAuth => models::fetch_profile_arn(&client, &cred).await,
+        auth::CredentialKind::OAuth => profile_arn_of(ctx, &mut stored, &client, &cred).await,
         auth::CredentialKind::ApiKey => None,
     };
     let body = wire::build(&req.body, &wire_model, profile_arn.as_deref())?;
-    let url = endpoints::chat_url(&cred);
-    let mut headers = auth::auth_headers(&cred);
-    headers.push(("content-type".to_string(), "application/json".to_string()));
 
-    let response = crate::http::post_stream(
-        &client,
-        &url,
-        &headers,
-        &body,
-        "application/vnd.amazon.eventstream",
-    )
-    .await?;
+    let mut response = post_conversation(&client, &cred, &body).await?;
+    // ── 401 / 403：续期一次再原样重发 ───────────────────────────
+    // 这一步必须在插件里做：`kiro` 是 scoped runtime，网关对非限额错误走
+    // 严格投影直接抛回用户，不会再给一次机会。续期失败则保留原始 401 交给
+    // 网关分类（TokenExpired），文案仍然是「凭证不可用」。
+    if matches!(response.status, 401 | 403) && cred.kind == auth::CredentialKind::OAuth {
+        if let Ok(next) = refresh_and_persist(ctx, &mut stored, &cred).await {
+            cred = next;
+            response = post_conversation(&client, &cred, &body).await?;
+        }
+    }
 
     if !response.is_success() {
+        // ── 非 2xx 走**数据通道**，不要返回 Err ────────────────────
+        // 返回 `Err(String)` 会被 SDK 包成 `INTERNAL`，scoped runtime 的严格
+        // 投影于是只给一句「原始诊断已隐藏」的 502 —— `classify()` 永远不被
+        // 调用，限额 / 凭证失效 / 封号全都不再触发冷却与换号。
+        // 把上游状态码与错误体原样推给网关：它的 `status >= 400` 分支会收齐
+        // 正文、调本家的 `classify`，再按四档处置。
         let status = response.status;
-        let body = response.error_body.clone().unwrap_or_default();
-        return Err(classify_error_text(status, &body));
+        let error_body = response.error_body.clone().unwrap_or_default();
+        sink.head(proto::StreamHead {
+            status,
+            headers: [("content-type".to_string(), "application/json".to_string())]
+                .into_iter()
+                .collect(),
+            upstream: proto::UpstreamKind::Chat,
+        })
+        .await?;
+        sink.send(error_body.as_bytes()).await?;
+        return Ok(());
     }
 
     sink.head(proto::StreamHead {
@@ -718,10 +833,55 @@ async fn run_chat(
     Ok(())
 }
 
-/// 把上游错误体折成一句可读的失败原因（分类在 `classify` 里做）。
-fn classify_error_text(status: u16, body: &str) -> String {
-    let head: String = body.chars().take(240).collect();
-    format!("Kiro 上游返回 HTTP {status}：{head}")
+/// 发一次 `generateAssistantResponse`，返回**未读的**响应（调用方消费流）。
+async fn post_conversation(
+    client: &reqwest::Client,
+    cred: &auth::KiroCredential,
+    body: &serde_json::Value,
+) -> Result<crate::http::SseResponse, String> {
+    let url = endpoints::chat_url(cred);
+    let mut headers = auth::auth_headers(cred);
+    headers.push(("content-type".to_string(), "application/json".to_string()));
+    crate::http::post_stream(
+        client,
+        &url,
+        &headers,
+        body,
+        "application/vnd.amazon.eventstream",
+    )
+    .await
+}
+
+/// 取 profileArn：先看 secret 里缓存的，没有再问一次上游并写回。
+///
+/// ── 为什么要缓存 ────────────────────────────────────────────
+/// `ListAvailableProfiles` 是 OAuth 账号的**每次对话**都要用到的附加信息，
+/// 但它在账号生命周期里几乎不变。以前每个请求都打一次，等于把每轮对话的
+/// 上游往返凭空多一倍（还多一份被限流的风险）。
+async fn profile_arn_of(
+    ctx: &agent2api_provider_sdk::PluginCtx,
+    stored: &mut agent2api_provider_sdk::StoreAccount,
+    client: &reqwest::Client,
+    cred: &auth::KiroCredential,
+) -> Option<String> {
+    if let Some(arn) = stored
+        .secret
+        .get("profileArn")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(arn.to_string());
+    }
+    let arn = models::fetch_profile_arn(client, cred).await?;
+    let secret = crate::store::with_fields(
+        &stored.secret,
+        &[("profileArn", serde_json::json!(arn))],
+    );
+    // 条件写回：并发的另一次对话先写成功了也不算错（值一样，下一轮照常命中）。
+    // 本地同步一份，让紧随其后的续期用**同一个** expect。
+    let _ = ctx.store_update(&stored.id, &stored.secret, &secret).await;
+    stored.secret = secret;
+    Some(arn)
 }
 
 #[cfg(test)]
@@ -820,5 +980,40 @@ mod tests {
     #[test]
     fn empty_payload_is_rejected_with_actionable_wording() {
         assert!(oauth_account_of_payload(&json!({}), None).is_err());
+    }
+
+    #[test]
+    fn login_secret_keeps_oidc_client_and_expiry() {
+        // 续期要用登录时注册的那份 clientId/clientSecret，且 expiresAt 要落库
+        // —— 少任何一个，「一小时后必须重新登录」都会回来。
+        let cred = auth::KiroCredential {
+            access_token: "at".into(),
+            api_key: String::new(),
+            refresh_token: Some("rt".into()),
+            region: "us-east-1".into(),
+            kind: auth::CredentialKind::OAuth,
+            client_id: Some("cid".into()),
+            client_secret: Some("csecret".into()),
+            expires_at: Some(1_900_000_000_000),
+        };
+        let account = oauth_account_of(&cred);
+        assert_eq!(account.secret["clientId"], "cid");
+        assert_eq!(account.secret["clientSecret"], "csecret");
+        assert_eq!(account.secret["expiresAt"], 1_900_000_000_000_i64);
+        assert_eq!(account.public["expiresAt"], 1_900_000_000_000_i64);
+        // 落库后再还原，三个字段都要在（续期与临期判断都靠它们）。
+        let back = credential_from_secret(&account.secret).expect("应能还原");
+        assert_eq!(back.client_id.as_deref(), Some("cid"));
+        assert_eq!(back.client_secret.as_deref(), Some("csecret"));
+        assert_eq!(back.expires_at, Some(1_900_000_000_000));
+    }
+
+    #[test]
+    fn expiry_window_is_five_minutes() {
+        let now = 1_800_000_000_000_i64;
+        assert!(!is_expiring(None, now), "判不出来不算临期");
+        assert!(!is_expiring(Some(now + 10 * 60 * 1000), now));
+        assert!(is_expiring(Some(now + 4 * 60 * 1000), now));
+        assert!(is_expiring(Some(now - 1000), now), "已过期必须算临期");
     }
 }

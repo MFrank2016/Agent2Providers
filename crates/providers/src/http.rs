@@ -29,8 +29,23 @@ use serde_json::Value;
 /// 控制面请求的超时（目录 / 余额 / 签到这类小请求）。
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 客户端缓存（键 = 代理 URL，空串 = 直连）。
+/// 流式请求的**建连**超时（连不上就不必等满整个读空闲窗口）。
+pub const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 流式请求的**读空闲**超时（两次收到字节之间的最大间隔）。
+///
+/// 它约束的是「上游卡住不说话」，不是「整条回答的总时长」—— 后者由上游
+/// 自己的生成长度决定，插件侧不该设上限。
+pub const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 控制面客户端缓存（键 = 代理 URL，空串 = 直连）。
 fn cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 流式客户端缓存（与 [`cache`] **分开**：同一代理下要两种超时口径）。
+fn stream_cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
     static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -66,7 +81,8 @@ fn build(proxy_url: &str) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         // 与网关同一条栈：rustls，不依赖系统 openssl
         .use_rustls_tls()
-        // 控制面的默认超时；流式请求由调用方用 `.timeout()` 覆盖
+        // 控制面的默认超时；**流式请求不要用这个客户端**（总超时会掐断
+        // 长回答），改用 [`stream_client`]。
         .timeout(CONTROL_TIMEOUT);
     let trimmed = proxy_url.trim();
     if trimmed.is_empty() || trimmed == "direct" {
@@ -84,6 +100,57 @@ fn build(proxy_url: &str) -> reqwest::Client {
                 // 见 `client()` 的说明：降级直连，不阻断链路
                 builder = builder.no_proxy();
             }
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 取一个**流式**客户端：代理口径与 [`client`] 完全一致，但**不设总超时**。
+///
+/// ── 为什么流式不能用 [`client`] ──────────────────────────────
+/// [`client`] 带着 [`CONTROL_TIMEOUT`]（20 秒）的 `.timeout()`。reqwest 的
+/// client 超时覆盖**整个响应体读取**，不是「等响应头」—— 对流式对话来说，
+/// 那就是「回答到第 20 秒被硬掐断」，症状是长答复必然截断、短答复正常，
+/// 极容易被误判成上游问题。
+///
+/// 这里换成两条**只约束单次操作**的超时：
+///   - [`STREAM_CONNECT_TIMEOUT`]：建连（含 TLS）等多久；
+///   - [`STREAM_READ_TIMEOUT`]：两次读到字节之间的最大空闲。
+///
+/// 于是「上游一直不说」会超时（不会挂死），而「上游说得慢 / 说很久」不会
+/// 被掐断。调用方**不要**再在单条请求上加 `.timeout()`。
+pub fn stream_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
+    let key = match proxy {
+        Some(proxy) => proxy.to_url(),
+        None => gateway_proxy.trim().to_string(),
+    };
+    if let Ok(guard) = stream_cache().lock() {
+        if let Some(client) = guard.get(&key) {
+            return client.clone();
+        }
+    }
+    let built = build_stream(&key);
+    if let Ok(mut guard) = stream_cache().lock() {
+        guard.insert(key, built.clone());
+    }
+    built
+}
+
+/// 建一个流式客户端（代理 URL 为空 / `direct` = 直连）。
+fn build_stream(proxy_url: &str) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(STREAM_CONNECT_TIMEOUT)
+        .read_timeout(STREAM_READ_TIMEOUT);
+    let trimmed = proxy_url.trim();
+    if trimmed.is_empty() || trimmed == "direct" {
+        // 与 [`build`] 同一条口径：直连就是直连（见那里的 `no_proxy()` 说明）。
+        builder = builder.no_proxy();
+    } else {
+        match reqwest::Proxy::all(trimmed) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            // 代理配错降级直连（与 [`client`] 一致）
+            Err(_) => builder = builder.no_proxy(),
         }
     }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
@@ -191,6 +258,9 @@ pub async fn post_form(
 ///
 /// 非 2xx 也返回结果（与 [`get_json`] 同口径：判定权在调用方）；但错误体
 /// 会被读出来放进 [`SseResponse::error_body`]，免得调用方忘了读。
+///
+/// `client` 应当是 [`stream_client`] 给的：带 [`CONTROL_TIMEOUT`] 的控制面
+/// 客户端会把长回答在第 20 秒掐断。
 pub async fn post_stream(
     client: &reqwest::Client,
     url: &str,
