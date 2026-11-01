@@ -760,8 +760,15 @@ async fn run_chat(
     // `q.{region}`，部分账号缺这个字段会 400。拿不到就给 `None` ——
     // best-effort，绝不因为「查不到 profile」把整条对话判失败。
     // 取到一次就写进 secret 复用，免得每个对话请求都多打一次上游。
+    //
+    // `ListAvailableProfiles` 是**控制面**请求，必须用带总超时的 `client`：
+    // `stream_client` 只有建连 20s + 读空闲 120s、**没有总超时**，端点
+    // 「连上了但不吐字节」时会把每轮对话在上游之前拖满 120 秒。
     let profile_arn = match cred.kind {
-        auth::CredentialKind::OAuth => profile_arn_of(ctx, &mut stored, &client, &cred).await,
+        auth::CredentialKind::OAuth => {
+            let control = crate::http::client(None, "");
+            profile_arn_of(ctx, &mut stored, &control, &cred).await
+        }
         auth::CredentialKind::ApiKey => None,
     };
     let body = wire::build(&req.body, &wire_model, profile_arn.as_deref())?;
@@ -853,6 +860,10 @@ async fn post_conversation(
 }
 
 /// 取 profileArn：先看 secret 里缓存的，没有再问一次上游并写回。
+///
+/// `client` 必须是**控制面**客户端（[`crate::http::client`]，20s 总超时），
+/// 不能传流式客户端：`ListAvailableProfiles` 只回一小段 JSON，用
+/// [`crate::http::stream_client`] 会让「连上但不吐字节」拖满读空闲 120s。
 ///
 /// ── 为什么要缓存 ────────────────────────────────────────────
 /// `ListAvailableProfiles` 是 OAuth 账号的**每次对话**都要用到的附加信息，
