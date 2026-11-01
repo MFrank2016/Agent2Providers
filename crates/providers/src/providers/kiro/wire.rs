@@ -9,6 +9,8 @@
 //! padding 常量照抄官方客户端：user 用 `Continue`、assistant 用 `understood`。
 //! **不要**用形似系统消息的标记 —— 模型会模仿并输出到正文。
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Map, Value};
 
 /// history 上限（实测 198 过、200 报 `Input is too long.`）。
@@ -17,6 +19,98 @@ pub const MAX_HISTORY_ENTRIES: usize = 198;
 pub const CONTINUE_PADDING: &str = "Continue";
 /// assistant turn 的空档填充。
 pub const ACKNOWLEDGE_PADDING: &str = "understood";
+/// 只有工具结果、没有用户正文时的占位文案。
+pub const TOOL_RESULTS_PADDING: &str = "Tool results provided.";
+
+/// 一轮对话：user 带工具结果，assistant 带工具调用。
+#[derive(Default)]
+struct Turn {
+    is_user: bool,
+    text: String,
+    tool_uses: Vec<Value>,
+    tool_results: Vec<Value>,
+    /// 对不上 `toolUseId` 的结果，降级成文本后追加到正文。
+    degraded: Vec<String>,
+}
+
+impl Turn {
+    fn user(text: String) -> Self {
+        Self {
+            is_user: true,
+            text,
+            ..Self::default()
+        }
+    }
+
+    fn assistant(text: String, tool_uses: Vec<Value>) -> Self {
+        Self {
+            is_user: false,
+            text,
+            tool_uses,
+            ..Self::default()
+        }
+    }
+
+    fn padding(is_user: bool) -> Self {
+        Self {
+            is_user,
+            text: if is_user {
+                CONTINUE_PADDING.to_string()
+            } else {
+                ACKNOWLEDGE_PADDING.to_string()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// 把一组工具结果挂到这一轮上。
+    fn attach(&mut self, group: PendingTools) {
+        self.tool_results = group.results;
+        self.degraded = group.degraded;
+    }
+
+    /// 正文 = 原始文本 + 降级成文本的工具结果；只有工具结果时用占位文案。
+    fn content(&self) -> String {
+        let mut content = self.text.clone();
+        for line in &self.degraded {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
+        }
+        if content.is_empty() && !self.tool_results.is_empty() {
+            return TOOL_RESULTS_PADDING.to_string();
+        }
+        content
+    }
+}
+
+/// 连续的 `role:"tool"` 消息累积成一组。
+#[derive(Default)]
+struct PendingTools {
+    results: Vec<Value>,
+    degraded: Vec<String>,
+}
+
+impl PendingTools {
+    /// `toolUseId` 必须是历史里真实发出过的；对不上的降级成文本。
+    fn push(&mut self, message: &Value, issued: &BTreeSet<String>) {
+        let id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let content = flatten_content(message.get("content"));
+        if !id.is_empty() && issued.contains(id) {
+            self.results.push(json!({
+                "toolUseId": id,
+                "content": [{ "text": content }],
+                "status": "success"
+            }));
+        } else {
+            self.degraded.push(format!("[tool result] {content}"));
+        }
+    }
+}
 
 /// 构造请求体。
 pub fn build(body: &Value, model: &str, profile_arn: Option<&str>) -> Result<Value, String> {
@@ -28,82 +122,131 @@ pub fn build(body: &Value, model: &str, profile_arn: Option<&str>) -> Result<Val
         return Err("messages 为空".to_string());
     }
 
-    // ① 拆出 system（可能多条，按顺序拼接）
+    // ① 只有真实发出过的 toolUseId 才允许回灌（对不上上游会 400）。
+    let issued = issued_tool_ids(messages);
+
+    // ② 拆出 system（可能多条，按顺序拼接）
     let mut system_parts: Vec<String> = Vec::new();
-    let mut turns: Vec<(bool, String)> = Vec::new(); // (是否 user, 文本)
     for message in messages {
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("user");
-        let text = flatten_content(message.get("content"));
-        match role {
-            "system" | "developer" => system_parts.push(text),
-            "assistant" => turns.push((false, text)),
-            _ => turns.push((true, text)),
+        if matches!(role_of(message), "system" | "developer") {
+            system_parts.push(flatten_content(message.get("content")));
         }
+    }
+
+    // ③ 逐条转成轮次：assistant 的 tool_calls 变 toolUses，
+    //    连续的 tool 消息累积成一组，挂到紧随其后的 user turn 上。
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut pending: Option<PendingTools> = None;
+    for message in messages {
+        match role_of(message) {
+            "system" | "developer" => {}
+            "assistant" => {
+                // 畸形历史（tool 组后面直接跟 assistant）：结果自成一轮，不丢内容。
+                if let Some(group) = pending.take() {
+                    let mut turn = Turn::user(String::new());
+                    turn.attach(group);
+                    turns.push(turn);
+                }
+                turns.push(Turn::assistant(
+                    flatten_content(message.get("content")),
+                    tool_uses_of(message),
+                ));
+            }
+            "tool" => pending
+                .get_or_insert_with(PendingTools::default)
+                .push(message, &issued),
+            _ => {
+                let mut turn = Turn::user(flatten_content(message.get("content")));
+                if let Some(group) = pending.take() {
+                    turn.attach(group);
+                }
+                turns.push(turn);
+            }
+        }
+    }
+    // 末尾没有 user turn 承接的工具组属于 currentMessage。
+    let trailing_tools = pending.is_some();
+    if let Some(group) = pending.take() {
+        let mut turn = Turn::user(String::new());
+        turn.attach(group);
+        turns.push(turn);
     }
     if turns.is_empty() {
         return Err("messages 里没有 user / assistant 轮次".to_string());
     }
 
-    // ② system 拼进第一条 user turn
+    // ④ system 拼进第一条 user turn
     if !system_parts.is_empty() {
         let prefix = system_parts.join("\n\n");
-        if let Some(first_user) = turns.iter_mut().find(|(is_user, _)| *is_user) {
-            first_user.1 = format!("{prefix}\n\n{}", first_user.1);
+        if let Some(first_user) = turns.iter_mut().find(|turn| turn.is_user) {
+            first_user.text = if first_user.text.is_empty() {
+                prefix
+            } else {
+                format!("{prefix}\n\n{}", first_user.text)
+            };
         }
     }
 
-    // ③ 拆 currentMessage 与 history
-    let (_, current_text) = turns.pop().ok_or_else(|| "messages 为空".to_string())?;
-    let mut history: Vec<(bool, String)> = turns;
-
-    // ④ 补 padding 使 history 严格交替（起点必须是 user）
-    if history.first().is_some_and(|(is_user, _)| !*is_user) {
-        history.insert(0, (true, CONTINUE_PADDING.to_string()));
+    // ⑤ 摘出 currentMessage。挂在末轮上的工具结果留在 history：
+    //    currentMessage 只承载用户本轮指令，结果放在紧随 assistant 的 user turn 里，
+    //    上游只校验 toolUseId 是否真实存在，不要求结果在 currentMessage。
+    let mut current = turns.pop().ok_or_else(|| "messages 为空".to_string())?;
+    if !trailing_tools
+        && current.is_user
+        && (!current.tool_results.is_empty() || !current.degraded.is_empty())
+    {
+        let mut tool_turn = Turn::user(String::new());
+        tool_turn.tool_results = std::mem::take(&mut current.tool_results);
+        tool_turn.degraded = std::mem::take(&mut current.degraded);
+        turns.push(tool_turn);
     }
-    let mut normalized: Vec<(bool, String)> = Vec::with_capacity(history.len());
-    for (is_user, text) in history {
-        if let Some((last_is_user, _)) = normalized.last() {
-            if *last_is_user == is_user {
-                let filler = if is_user {
-                    CONTINUE_PADDING
-                } else {
-                    ACKNOWLEDGE_PADDING
-                };
-                normalized.push((!is_user, filler.to_string()));
-            }
+    let mut history = turns;
+
+    // ⑥ 补 padding 使 history 严格交替（起点必须是 user）
+    if history.first().is_some_and(|turn| !turn.is_user) {
+        history.insert(0, Turn::user(CONTINUE_PADDING.to_string()));
+    }
+    let mut normalized: Vec<Turn> = Vec::with_capacity(history.len());
+    for turn in history {
+        let same_role = normalized
+            .last()
+            .is_some_and(|last| last.is_user == turn.is_user);
+        if same_role {
+            normalized.push(Turn::padding(!turn.is_user));
         }
-        normalized.push((is_user, text));
+        normalized.push(turn);
     }
     // 末尾必须是 assistant（currentMessage 是 user）
-    if normalized.last().is_some_and(|(is_user, _)| *is_user) {
-        normalized.push((false, ACKNOWLEDGE_PADDING.to_string()));
+    if normalized.last().is_some_and(|turn| turn.is_user) {
+        normalized.push(Turn::padding(false));
     }
 
-    // ⑤ 超上限：把最老的折成一条文本 turn
+    // ⑦ 超上限：把最老的折成一条文本 turn
     if normalized.len() > MAX_HISTORY_ENTRIES {
         let fold_count = normalized.len() - MAX_HISTORY_ENTRIES + 1;
         let folded: Vec<String> = normalized
             .drain(..fold_count)
-            .map(|(is_user, text)| {
-                format!("{}: {text}", if is_user { "user" } else { "assistant" })
+            .map(|turn| {
+                format!(
+                    "{}: {}",
+                    if turn.is_user { "user" } else { "assistant" },
+                    turn.content()
+                )
             })
             .collect();
-        normalized.insert(0, (true, folded.join("\n")));
-        if normalized.get(1).is_some_and(|(is_user, _)| *is_user) {
-            normalized.insert(1, (false, ACKNOWLEDGE_PADDING.to_string()));
+        normalized.insert(0, Turn::user(folded.join("\n")));
+        if normalized.get(1).is_some_and(|turn| turn.is_user) {
+            normalized.insert(1, Turn::padding(false));
         }
     }
 
-    // ⑥ 组装
-    let mut current = Map::new();
-    current.insert("content".into(), Value::String(current_text));
-    current.insert("modelId".into(), Value::String(model.to_string()));
-    current.insert("origin".into(), Value::String("AI_EDITOR".to_string()));
-    if let Some(context) = user_context(body) {
-        current.insert("userInputMessageContext".into(), context);
+    // ⑧ 组装
+    let mut current_message = Map::new();
+    current_message.insert("content".into(), Value::String(current.content()));
+    current_message.insert("modelId".into(), Value::String(model.to_string()));
+    current_message.insert("origin".into(), Value::String("AI_EDITOR".to_string()));
+    if let Some(context) = current_context(body, &current.tool_results) {
+        current_message.insert("userInputMessageContext".into(), context);
     }
 
     let mut conversation = Map::new();
@@ -117,22 +260,12 @@ pub fn build(body: &Value, model: &str, profile_arn: Option<&str>) -> Result<Val
     );
     conversation.insert(
         "currentMessage".into(),
-        json!({ "userInputMessage": Value::Object(current) }),
+        json!({ "userInputMessage": Value::Object(current_message) }),
     );
     if !normalized.is_empty() {
         let entries: Vec<Value> = normalized
-            .into_iter()
-            .map(|(is_user, text)| {
-                if is_user {
-                    json!({ "userInputMessage": {
-                        "content": text,
-                        "modelId": model,
-                        "origin": "AI_EDITOR"
-                    }})
-                } else {
-                    json!({ "assistantResponseMessage": { "content": text } })
-                }
-            })
+            .iter()
+            .map(|turn| serialize_turn(turn, model))
             .collect();
         conversation.insert("history".into(), Value::Array(entries));
     }
@@ -143,6 +276,97 @@ pub fn build(body: &Value, model: &str, profile_arn: Option<&str>) -> Result<Val
     }
     request.insert("conversationState".into(), Value::Object(conversation));
     Ok(Value::Object(request))
+}
+
+fn role_of(message: &Value) -> &str {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+}
+
+/// 历史里真实发出过的 toolUseId 集合。
+fn issued_tool_ids(messages: &[Value]) -> BTreeSet<String> {
+    let mut issued = BTreeSet::new();
+    for message in messages {
+        if role_of(message) != "assistant" {
+            continue;
+        }
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for call in calls {
+            if let Some(id) = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                issued.insert(id.to_string());
+            }
+        }
+    }
+    issued
+}
+
+/// OpenAI `tool_calls[]` → Kiro `toolUses[]`。
+///
+/// `arguments` 是 JSON 字符串，解析成对象；解析失败就原样塞成字符串 ——
+/// 宁可让上游拒绝，也不要丢内容。
+fn tool_uses_of(message: &Value) -> Vec<Value> {
+    let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut uses = Vec::with_capacity(calls.len());
+    for call in calls {
+        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let function = call.get("function").unwrap_or(call);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        let input = match function.get("arguments") {
+            Some(Value::String(raw)) => {
+                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+            }
+            Some(Value::Null) | None => json!({}),
+            Some(other) => other.clone(),
+        };
+        uses.push(json!({ "toolUseId": id, "name": name, "input": input }));
+    }
+    uses
+}
+
+/// 序列化一条 history 轮次。
+fn serialize_turn(turn: &Turn, model: &str) -> Value {
+    if turn.is_user {
+        let mut user = Map::new();
+        user.insert("content".into(), Value::String(turn.content()));
+        user.insert("modelId".into(), Value::String(model.to_string()));
+        user.insert("origin".into(), Value::String("AI_EDITOR".to_string()));
+        if !turn.tool_results.is_empty() {
+            user.insert(
+                "userInputMessageContext".into(),
+                json!({ "toolResults": turn.tool_results }),
+            );
+        }
+        json!({ "userInputMessage": Value::Object(user) })
+    } else {
+        let mut assistant = Map::new();
+        assistant.insert("content".into(), Value::String(turn.content()));
+        if !turn.tool_uses.is_empty() {
+            assistant.insert("toolUses".into(), Value::Array(turn.tool_uses.clone()));
+        }
+        json!({ "assistantResponseMessage": Value::Object(assistant) })
+    }
+}
+
+/// currentMessage 的 context：工具声明 + 本轮回灌的工具结果。
+fn current_context(body: &Value, tool_results: &[Value]) -> Option<Value> {
+    let mut context = user_context(body).unwrap_or_else(|| json!({}));
+    if !tool_results.is_empty() {
+        context["toolResults"] = Value::Array(tool_results.to_vec());
+    }
+    if context.as_object().is_some_and(Map::is_empty) {
+        return None;
+    }
+    Some(context)
 }
 
 /// 工具声明挂到 currentMessage 的 `userInputMessageContext.tools`。
@@ -330,6 +554,115 @@ mod tests {
         assert_eq!(
             with["profileArn"],
             "arn:aws:codewhisperer:us-east-1:1:profile/x"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_calls_become_tool_uses() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "读文件" },
+                { "role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" }
+                }]},
+                { "role": "tool", "tool_call_id": "call_1", "content": "文件内容" }
+            ]
+        });
+        let wire = build(&body, "m", None).expect("应能构造");
+        let history = wire["conversationState"]["history"]
+            .as_array()
+            .expect("应有 history");
+        let assistant = history
+            .iter()
+            .find(|entry| entry.get("assistantResponseMessage").is_some())
+            .expect("应有 assistant 条目");
+        assert_eq!(
+            assistant["assistantResponseMessage"]["toolUses"][0]["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(
+            assistant["assistantResponseMessage"]["toolUses"][0]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            assistant["assistantResponseMessage"]["toolUses"][0]["input"]["path"],
+            "a.txt"
+        );
+
+        let current = &wire["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["content"], "Tool results provided.");
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["status"],
+            "success"
+        );
+    }
+
+    #[test]
+    fn tool_result_attaches_to_the_following_user_turn() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "读文件" },
+                { "role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{}" }
+                }]},
+                { "role": "tool", "tool_call_id": "call_1", "content": "文件内容" },
+                { "role": "user", "content": "继续" }
+            ]
+        });
+        let wire = build(&body, "m", None).expect("应能构造");
+        let history = wire["conversationState"]["history"]
+            .as_array()
+            .expect("应有 history");
+        let user_with_tools = history
+            .iter()
+            .find(|entry| {
+                entry
+                    .get("userInputMessage")
+                    .is_some_and(|u| u.get("userInputMessageContext").is_some())
+            })
+            .expect("应有一个带 toolResults 的 user turn");
+        assert_eq!(
+            user_with_tools["userInputMessage"]["userInputMessageContext"]["toolResults"][0]
+                ["toolUseId"],
+            "call_1"
+        );
+        assert_eq!(
+            wire["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+            "继续"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_use_id_degrades_to_text() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "开始" },
+                { "role": "tool", "tool_call_id": "never_issued", "content": "孤儿结果" },
+                { "role": "user", "content": "继续" }
+            ]
+        });
+        let wire = build(&body, "m", None).expect("应能构造");
+        let history = wire["conversationState"]["history"]
+            .as_array()
+            .expect("应有 history");
+        let joined = history
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("孤儿结果"),
+            "对不上的工具结果必须降级成文本保留"
+        );
+        assert!(
+            !joined.contains("\"toolResults\""),
+            "不得把未知 id 写进 toolResults"
         );
     }
 }
