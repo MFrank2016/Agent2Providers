@@ -149,6 +149,81 @@ impl Provider for KiroProvider {
         // 判不出来就 false：宁可漏刷，也不要凭猜测打上游。
         Box::pin(async move { Ok(false) })
     }
+
+    fn conversation<'a>(
+        &'a self,
+        ctx: &'a agent2api_provider_sdk::PluginCtx,
+        req: proto::ConversationRequest,
+        sink: agent2api_provider_sdk::ConversationSink<'a>,
+    ) -> agent2api_provider_sdk::SendFuture<'a, ()> {
+        Box::pin(async move { run_chat(ctx, req, sink).await })
+    }
+
+    fn classify(&self, status: u16, body: &serde_json::Value) -> proto::ErrorClass {
+        let message = body
+            .get("message")
+            .or_else(|| body.get("Message"))
+            .or_else(|| body.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Kiro 上游返回错误")
+            .to_string();
+        let lower = message.to_lowercase();
+        let upstream_code = body.get("code").and_then(serde_json::Value::as_i64);
+
+        // ① 封号：不是限额，必须让账号停下来
+        if lower.contains("temporarily_suspended")
+            || lower.contains("temporarily is suspended")
+            || lower.contains("account suspended")
+        {
+            return proto::ErrorClass::Fatal {
+                status,
+                message: "Kiro 账号已被上游暂停，请在官方客户端确认账号状态".to_string(),
+                upstream_code,
+            };
+        }
+
+        // ② 上下文过长：客户端自己的问题，绝不能罚账号
+        if lower.contains("input is too long") || lower.contains("too many tokens") {
+            return proto::ErrorClass::Fatal {
+                status,
+                message: "本次请求的上下文超过 Kiro 上限（history 最多 198 条），请开启新会话".to_string(),
+                upstream_code,
+            };
+        }
+
+        // ③ 加量包耗尽：与订阅耗尽分开表述
+        if status == 402 && lower.contains("overage") {
+            return proto::ErrorClass::QuotaLimited {
+                status,
+                message: "Kiro 加量包额度已用完（订阅额度可能仍在）".to_string(),
+                upstream_code,
+                reset_at: None,
+            };
+        }
+
+        // ④ 凭证失效
+        if status == 401
+            || lower.contains("invalid_grant")
+            || lower.contains("token expired")
+            || lower.contains("unauthorized")
+        {
+            return proto::ErrorClass::TokenExpired {
+                message: "Kiro 凭证不可用，请重新添加账号".to_string(),
+            };
+        }
+
+        // ⑤ 额度 / 速率
+        if status == 429 || lower.contains("quota") || lower.contains("rate limit") {
+            return proto::ErrorClass::QuotaLimited {
+                status,
+                message: "Kiro 账号额度或速率已达上限".to_string(),
+                upstream_code,
+                reset_at: None,
+            };
+        }
+
+        proto::ErrorClass::Fatal { status, message, upstream_code }
+    }
 }
 
 /// 从落盘 secret 还原凭证。
@@ -187,4 +262,135 @@ fn tail_of(token: &str) -> String {
     let chars: Vec<char> = token.chars().collect();
     let start = chars.len().saturating_sub(4);
     chars[start..].iter().collect()
+}
+
+/// 一次对话：取凭证 → 拼请求 → 发上游 → 解码帧 → 翻译 → 推 sink。
+async fn run_chat(
+    ctx: &agent2api_provider_sdk::PluginCtx,
+    req: proto::ConversationRequest,
+    mut sink: agent2api_provider_sdk::ConversationSink<'_>,
+) -> Result<(), String> {
+    let account = ctx
+        .store_get(ID, &req.account)
+        .await
+        .map_err(String::from)?;
+    let cred = credential_from_secret(&account.secret)?;
+    let client_model = req
+        .body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("claude-sonnet-4.5")
+        .to_string();
+    let wire_model = if req.wire_model.is_empty() {
+        client_model.clone()
+    } else {
+        req.wire_model.clone()
+    };
+    let body = wire::build(&req.body, &wire_model, None)?;
+    let url = endpoints::chat_url(&cred);
+    let mut headers = auth::auth_headers(&cred);
+    headers.push(("content-type".to_string(), "application/json".to_string()));
+
+    let client = crate::http::client(req.proxy.as_ref(), "");
+    let response = crate::http::post_stream(
+        &client,
+        &url,
+        &headers,
+        &body,
+        "application/vnd.amazon.eventstream",
+    )
+    .await?;
+
+    if !response.is_success() {
+        let status = response.status;
+        let body = response.error_body.clone().unwrap_or_default();
+        return Err(classify_error_text(status, &body));
+    }
+
+    sink.head(proto::StreamHead {
+        status: 200,
+        headers: [(
+            "content-type".to_string(),
+            "text/event-stream".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        upstream: proto::UpstreamKind::Chat,
+    })
+    .await?;
+
+    let Some(upstream) = response.response else {
+        return Err("Kiro 上游没有返回响应体".to_string());
+    };
+    let mut decoder = eventstream::FrameDecoder::new();
+    let mut translator = stream::FrameTranslator::new(&client_model);
+    let mut source = upstream.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk) = source.next().await {
+        let bytes = chunk.map_err(|error| format!("读 Kiro 上游失败：{error}"))?;
+        for frame in decoder.push(&bytes)? {
+            for text in translator.feed(&frame) {
+                sink.send(text.as_bytes()).await?;
+            }
+        }
+    }
+    decoder.finish()?;
+    for text in translator.finish() {
+        sink.send(text.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// 把上游错误体折成一句可读的失败原因（分类在 `classify` 里做）。
+fn classify_error_text(status: u16, body: &str) -> String {
+    let head: String = body.chars().take(240).collect();
+    format!("Kiro 上游返回 HTTP {status}：{head}")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn classify(status: u16, message: &str) -> proto::ErrorClass {
+        KiroProvider.classify(status, &json!({ "message": message }))
+    }
+
+    #[test]
+    fn quota_429_is_quota_limited() {
+        assert!(matches!(classify(429, "quota exceeded"), proto::ErrorClass::QuotaLimited { .. }));
+    }
+
+    #[test]
+    fn overage_402_is_quota_limited_with_overage_wording() {
+        match classify(402, "overage limit reached") {
+            proto::ErrorClass::QuotaLimited { message, .. } => {
+                assert!(message.contains("加量包"), "文案应区分加量包：{message}");
+            }
+            other => panic!("期望 QuotaLimited，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suspended_account_is_fatal() {
+        assert!(matches!(
+            classify(403, "account temporarily_suspended"),
+            proto::ErrorClass::Fatal { .. }
+        ));
+    }
+
+    #[test]
+    fn input_too_long_is_fatal_and_not_quota() {
+        assert!(matches!(
+            classify(400, "Input is too long."),
+            proto::ErrorClass::Fatal { .. }
+        ));
+    }
+
+    #[test]
+    fn auth_errors_are_token_expired() {
+        assert!(matches!(classify(401, "unauthorized"), proto::ErrorClass::TokenExpired { .. }));
+        assert!(matches!(classify(403, "invalid_grant"), proto::ErrorClass::TokenExpired { .. }));
+    }
 }
