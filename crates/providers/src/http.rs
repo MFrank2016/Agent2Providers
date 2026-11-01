@@ -159,6 +159,29 @@ pub async fn post_json(
     Ok((status, parse_json(&text)))
 }
 
+/// 发一次 `application/x-www-form-urlencoded` POST 并解析 JSON 响应。
+///
+/// ── 为什么单独一个函数 ──────────────────────────────────────
+/// [`post_json`] 把 body 序列化成 JSON，而 OAuth 的 `/token` 这类端点
+/// 只认表单编码；[`send_raw`] 的 body 参数是 `Option<&Value>`，同样发不了
+/// 表单。返回口径与另两个一致：**非 2xx 也给 `Ok`**，判定权在调用方。
+pub async fn post_form(
+    client: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+) -> Result<(u16, Value), String> {
+    let response = client
+        .post(url)
+        .header("Accept", "application/json")
+        .form(form)
+        .send()
+        .await
+        .map_err(|error| describe(&error))?;
+    let status = response.status().as_u16();
+    let text = response.text().await.map_err(|error| describe(&error))?;
+    Ok((status, parse_json(&text)))
+}
+
 /// 发一次 POST（JSON 体），返回**未读的响应**（调用方自己消费流）。
 ///
 /// ── 什么时候用这个而不是 [`post_json`] ──────────────────────

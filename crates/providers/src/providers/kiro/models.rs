@@ -74,6 +74,26 @@ pub fn profile_arn_of(payload: &Value) -> Option<String> {
         })
 }
 
+/// 取一个 profileArn（`ListAvailableProfiles`，best-effort）。
+///
+/// ── 为什么吞掉错误 ──────────────────────────────────────────
+/// profileArn 是 OAuth 账号打 `GenerateAssistantResponse` 的可选参数：上游
+/// 在部分账号上确实要求它，但「拿不到」不该让整条对话失败 —— 没有它时
+/// 请求仍然可能成功（API Key 账号就是永远不带）。所以这里返回 `Option`，
+/// 网络错误 / 非 2xx / 空列表一律给 `None`。
+pub async fn fetch_profile_arn(client: &reqwest::Client, cred: &KiroCredential) -> Option<String> {
+    let url = format!("https://q.{}.amazonaws.com/ListAvailableProfiles", cred.region);
+    let headers = super::auth::auth_headers(cred);
+    let body = json!({ "maxResults": PAGE_SIZE });
+    let (status, payload) = crate::http::post_json(client, &url, &headers, &body)
+        .await
+        .ok()?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    profile_arn_of(&payload)
+}
+
 /// 拉一次完整目录（自动翻页）。
 pub async fn fetch_all(
     client: &reqwest::Client,
