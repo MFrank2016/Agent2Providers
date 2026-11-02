@@ -82,8 +82,15 @@ fn text<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 /// 形状（键名照抄别家，界面按这套键读）：
 /// ```text
 ///   { available?, unit, plan, wallets: [{type, displayName, balance}],
-///     credits: [{name, remain}], raw: {points, entitlement} }
+///     credits: [{name, remain, snapshot?}], raw: {points, entitlement} }
 /// ```
+/// ── `snapshot: true` 是 UI 契约，不是装饰 ────────────────────
+/// 界面（`ui-shared/usage-readings.ts` 的 `snapshotReadingOf`）只有看到
+/// `snapshot === true` 才把这一行渲染成「名字 + 数字」；否则任何带 `remain`
+/// 的行都会走积分包路径渲染成「剩 {remain}」—— 于是「累计获得 2000」会被读成
+/// 「还剩 2000」。所以 `累计获得` / `累计消耗` / `已过期` 是**累计快照**，
+/// 必须带 `snapshot: true`；只有 `可用积分` 是真正的剩余量，保持不带。
+///
 /// 契约见模块头：没有 `availableBalance` 就不写 `available` / `wallets`。
 pub fn shape(points: &Value, entitlement: &Value, identity: &Value) -> Value {
     // `control::*` 已经拆过 `data` 信封；再认一层 `account` 是为了兼容
@@ -105,14 +112,14 @@ pub fn shape(points: &Value, entitlement: &Value, identity: &Value) -> Value {
         credits.push(json!({"name":"可用积分","remain":amount(value)}));
     }
     if let Some(value) = total_granted {
-        credits.push(json!({"name":"累计获得","remain":amount(value)}));
+        credits.push(json!({"name":"累计获得","remain":amount(value),"snapshot":true}));
     }
     if let Some(value) = total_consumed {
-        credits.push(json!({"name":"累计消耗","remain":amount(value)}));
+        credits.push(json!({"name":"累计消耗","remain":amount(value),"snapshot":true}));
     }
     // 过期一栏只在真的有过期积分时出现：恒为 0 的一行只会占位。
     if let Some(value) = total_expired.filter(|value| *value > 0.0) {
-        credits.push(json!({"name":"已过期","remain":amount(value)}));
+        credits.push(json!({"name":"已过期","remain":amount(value),"snapshot":true}));
     }
     let wallets = available
         .map(|value| {
@@ -280,6 +287,39 @@ mod tests {
             .as_array()
             .map(|items| items.iter().any(|item| item["name"] == "已过期"))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn cumulative_rows_are_snapshots_but_available_is_not() {
+        // UI 契约：只有 snapshot:true 才按「名字 + 数字」渲染，否则带 remain 的
+        // 行会被画成「剩 {remain}」——「累计获得 2000」会变成「还剩 2000」。
+        let value = shape(
+            &json!({"account":{
+                "availableBalance":1234,
+                "totalGranted":2000,
+                "totalConsumed":766,
+                "totalExpired":10
+            }}),
+            &Value::Null,
+            &Value::Null,
+        );
+        let rows = value["credits"].as_array().cloned().unwrap_or_default();
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row["name"] == name)
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        // 可用积分是真实剩余量：不带 snapshot
+        assert_eq!(row("可用积分")["remain"], 1234);
+        assert!(row("可用积分").get("snapshot").is_none());
+        // 三个累计项都是快照：带 snapshot: true
+        for name in ["累计获得", "累计消耗", "已过期"] {
+            assert_eq!(row(name)["snapshot"], true, "{name} 必须是 snapshot");
+        }
+        assert_eq!(row("累计获得")["remain"], 2000);
+        assert_eq!(row("累计消耗")["remain"], 766);
+        assert_eq!(row("已过期")["remain"], 10);
     }
 
     #[test]
