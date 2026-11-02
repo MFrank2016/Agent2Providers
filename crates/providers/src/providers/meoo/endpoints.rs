@@ -17,10 +17,11 @@
 //! 授权与换码都会被拒。
 //!
 //! ── 基址覆盖必须过 host 白名单 ────────────────────────────────
-//! `MEOO_API_BASE` / `MEOO_GATEWAY_BASE` 只接受正式 host；填错域名时**回落到
+//! `MEOO_API_BASE` / `MEOO_GATEWAY_BASE` 只接受正式 host，且**非 loopback 必须是
+//! `https`**（OAuth code / token 不能明文出网）；填错域名 / 协议时**回落到
 //! 默认值**而不是照单全收，避免一个手滑的环境变量把 OAuth token 发到陌生主机。
 //! 单测要打本地假服务器时设 `MEOO_ALLOW_INSECURE_BASE=1` 放行 loopback ——
-//! 这是唯一的例外，且只放行 `127.0.0.1` / `localhost`。
+//! 这是唯一的例外，只放行 `127.0.0.1` / `localhost`，且允许其用 `http`。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -56,11 +57,25 @@ pub const TEST_CLIENT_ID: &str = "meoo_app_SFNvmHUFNePxyyfGjCd9hyaE";
 /// 正式环境 hostname（与官方 CLI 逐字一致）
 const PROD_HOSTS: &[&str] = &["meoo.com", "gray-meoo.aliyun-inc.com"];
 
+/// 解析 URL，返回（scheme 小写，hostname 小写）。解析失败或无 host 时返回 `None`。
+fn scheme_and_host(value: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(value).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some((url.scheme().to_ascii_lowercase(), host))
+}
+
 /// 取 URL 的 hostname（小写）。解析失败或无 host 时返回 `None`。
 fn host_of(value: &str) -> Option<String> {
-    url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+    scheme_and_host(value).map(|(_, host)| host)
+}
+
+/// 非回环基址是否走了加密传输。
+///
+/// 只查 host 不查 scheme 会让 `http://meoo.com` 过关 —— OAuth code 与 token
+/// 都会明文出网，所以正式域名**必须** https。loopback 例外见
+/// [`loopback_allowed`]。
+fn is_https(value: &str) -> bool {
+    scheme_and_host(value).is_some_and(|(scheme, _)| scheme == "https")
 }
 
 /// 单测打本地假服务器时是否放行 loopback 基址（`MEOO_ALLOW_INSECURE_BASE=1`）
@@ -71,7 +86,7 @@ fn insecure_test_base_allowed() -> bool {
     )
 }
 
-/// loopback 且显式放行时才允许
+/// loopback 且显式放行时才允许（此时允许 http：本机回环不出网）
 fn loopback_allowed(value: &str) -> bool {
     insecure_test_base_allowed()
         && host_of(value)
@@ -79,17 +94,19 @@ fn loopback_allowed(value: &str) -> bool {
             .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
 }
 
-/// `MEOO_API_BASE` 是否可接受：正式 host，或显式放行的 loopback
+/// `MEOO_API_BASE` 是否可接受：https 的正式 host，或显式放行的 loopback
 fn allowed_api_base(value: &str) -> bool {
-    host_of(value)
-        .as_deref()
-        .is_some_and(|host| PROD_HOSTS.contains(&host))
+    (is_https(value)
+        && host_of(value)
+            .as_deref()
+            .is_some_and(|host| PROD_HOSTS.contains(&host)))
         || loopback_allowed(value)
 }
 
-/// `MEOO_GATEWAY_BASE` 是否可接受：只认 `api.meoo.host`，或显式放行的 loopback
+/// `MEOO_GATEWAY_BASE` 是否可接受：https 的 `api.meoo.host`，或显式放行的 loopback
 fn allowed_gateway_base(value: &str) -> bool {
-    host_of(value).as_deref() == Some("api.meoo.host") || loopback_allowed(value)
+    (is_https(value) && host_of(value).as_deref() == Some("api.meoo.host"))
+        || loopback_allowed(value)
 }
 
 /// 读环境变量覆盖（空值视为未设置），去掉首尾空白与尾部斜杠
@@ -240,5 +257,20 @@ mod tests {
             "https://api.meoo.host/meoo-ai/compatible-mode/v1"
         ));
         assert!(!allowed_gateway_base("https://evil.example/meoo-ai"));
+    }
+
+    #[test]
+    fn plaintext_base_is_rejected_outside_loopback() {
+        // 非回环基址必须是 https：OAuth code / token 不能明文出网
+        assert!(!allowed_api_base("http://meoo.com"));
+        assert!(!allowed_api_base("http://gray-meoo.aliyun-inc.com"));
+        assert!(!allowed_gateway_base(
+            "http://api.meoo.host/meoo-ai/compatible-mode/v1"
+        ));
+        // 同 host 的 https 仍然放行
+        assert!(allowed_api_base("https://meoo.com"));
+        assert!(allowed_gateway_base(
+            "https://api.meoo.host/meoo-ai/compatible-mode/v1"
+        ));
     }
 }
