@@ -189,6 +189,12 @@
       "label": "Kiro",
       "order": 30,
       "default_enabled": true
+    },
+    {
+      "id": "meoo",
+      "label": "Meoo 秒悟",
+      "order": 31,
+      "default_enabled": true
     }
   ],
   "icons": "assets",

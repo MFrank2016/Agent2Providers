@@ -44,6 +44,8 @@ pub mod kuku;
 pub mod lobsterai;
 #[cfg(feature = "loomy")]
 pub mod loomy;
+#[cfg(feature = "meoo")]
+pub mod meoo;
 #[cfg(feature = "modelscope")]
 pub mod modelscope;
 #[cfg(feature = "monkeycode")]
@@ -175,6 +177,9 @@ pub fn registry() -> Vec<BoxProvider> {
     {
         list.push(Box::new(kiro::KiroProvider));
     }
+
+    #[cfg(feature = "meoo")]
+    list.push(Box::new(meoo::MeooProvider));
 
     list
 }
