@@ -70,10 +70,15 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Pending>> {
     }
 }
 
+/// 表项是否已超过 [`PENDING_TTL_MS`]（纯函数：换票前的那道闸门）。
+fn expired(created_at: i64, now: i64) -> bool {
+    now - created_at >= PENDING_TTL_MS
+}
+
 /// 清掉超过 [`PENDING_TTL_MS`] 的表项。
 fn sweep(table: &mut HashMap<String, Pending>) {
     let now = crate::http::now_ms();
-    table.retain(|_, item| now - item.created_at < PENDING_TTL_MS);
+    table.retain(|_, item| !expired(item.created_at, now));
 }
 
 /// 只接受 OAuth 方式（`methodIndex` 0 / 缺省）。
@@ -161,6 +166,13 @@ pub async fn exchange_callback(
             message: "这次登录已取消或已过期，请重新发起".to_string(),
         });
     };
+    // 表项可能躲过了 `sweep`（sweep 只在 begin_login 时跑），也可能回调来得太
+    // 晚：超过 TTL 的 state 不能换票，否则「6 分钟有效」只是一句注释。
+    if expired(pending.created_at, crate::http::now_ms()) {
+        return Ok(proto::LoginPoll::Failed {
+            message: "这次登录已超过 6 分钟有效期，请重新发起登录".to_string(),
+        });
+    }
     let raw = if callback.url.trim().is_empty() {
         callback.code.clone()
     } else {
@@ -558,6 +570,16 @@ mod tests {
         // 缺省 / 0 都按 OAuth 处理
         assert!(ensure_oauth_method(&serde_json::json!({})).is_ok());
         assert!(ensure_oauth_method(&serde_json::json!({ "methodIndex": 0 })).is_ok());
+    }
+
+    #[test]
+    fn pending_expires_after_six_minutes() {
+        let created = 1_000_000;
+        // 5:59 还在窗口内
+        assert!(!expired(created, created + PENDING_TTL_MS - 1));
+        // 正好 6 分钟起作废（>=，不是 >）
+        assert!(expired(created, created + PENDING_TTL_MS));
+        assert!(expired(created, created + PENDING_TTL_MS + 60_000));
     }
 
     #[test]

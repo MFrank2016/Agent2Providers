@@ -399,7 +399,8 @@ pub async fn list(ctx: &PluginCtx, account: &str) -> proto::ModelList {
 /// 刷新目录：成功落地并返回条数；失败保留旧清单、如实回报原因。
 ///
 /// `force = false`（自动路径）时 TTL 内早退为 `unchanged()`；
-/// `force = true`（用户手动刷新）真打上游，并绕过负缓存。
+/// `force = true`（用户手动刷新）真打上游，并绕过负缓存 —— 失败**不**记
+/// 失败时刻，否则刚刷过一次的账号接下来 5 分钟的自动刷新会被自己抑制掉。
 pub async fn refresh(ctx: &PluginCtx, account: &str, force: bool) -> proto::RefreshOutcome {
     if !force && fresh() {
         return proto::RefreshOutcome::unchanged();
@@ -420,8 +421,13 @@ pub async fn refresh(ctx: &PluginCtx, account: &str, force: bool) -> proto::Refr
             proto::RefreshOutcome::refreshed(count)
         }
         Err(error) => {
-            // 与 list 同一条负缓存：失败也记时刻，自动刷新不会每轮都打上游。
-            negative_cache(http::now_ms());
+            // 只有**自动**路径（`force = false`）才记负缓存：用户手动刷新失败后
+            // 还写 `remote = false` + 5 分钟 TTL，等于把「我刚刷过一次」的证据
+            // 抹掉，接下来 5 分钟的自动刷新全被抑制，界面停在一份旧清单上。
+            // 手动刷新的结果如实回报，缓存保持原样。
+            if !force {
+                negative_cache(http::now_ms());
+            }
             proto::RefreshOutcome::failed(error.message)
         }
     }

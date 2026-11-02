@@ -116,6 +116,36 @@ pub async fn list_projects(
     Ok(list)
 }
 
+/// 按顺序取第一个**非空字符串**字段（`url_id` / `urlId` / `id` 这类改名容错）。
+fn text_of<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
+}
+
+/// 项目列表 → 只读摘要（`{"projects": [{"urlId", "name"}]}`）。
+///
+/// 上游条目里还有环境、密钥、额度等字段，原样透出等于把控制面响应搬进网关
+/// 接口 —— 这里**只**保留 `urlId` / `name` 两个字段，其余一律丢弃。没有名字
+/// 时用 `urlId` 兜底（界面至少能显示一行可点的项目，而不是空白）。
+///
+/// 纯函数：不读账号、不发请求，便于把「哪些字段能出网关」这条边界测死。
+pub fn project_summaries(projects: &[Value]) -> Value {
+    let items = projects
+        .iter()
+        .filter_map(|item| {
+            let url_id = text_of(item, &["url_id", "urlId", "id"])?;
+            let name = text_of(item, &["name", "title"]).unwrap_or(url_id);
+            Some(serde_json::json!({ "urlId": url_id, "name": name }))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "projects": items })
+}
+
 /// 解析某个项目的服务 AK（`meoo_project_service_v1.*`）。
 ///
 /// `allow_cloud_enable` 为真且环境里还没有 AK 时才 POST `/cloud` 开通；
@@ -222,4 +252,53 @@ pub async fn entitlement(
         "Meoo 权益查询",
     )
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn project_summaries_accept_three_id_spellings() {
+        let value = project_summaries(&[
+            json!({"url_id": "p1", "name": "项目一"}),
+            json!({"urlId": "p2", "name": "项目二"}),
+            json!({"id": "p3", "name": "项目三"}),
+        ]);
+        assert_eq!(
+            value["projects"],
+            json!([
+                {"urlId": "p1", "name": "项目一"},
+                {"urlId": "p2", "name": "项目二"},
+                {"urlId": "p3", "name": "项目三"},
+            ])
+        );
+    }
+
+    #[test]
+    fn project_summaries_fall_back_to_url_id_and_drop_idless_rows() {
+        let value = project_summaries(&[
+            json!({"url_id": "p1"}),
+            json!({"url_id": "p2", "name": "   "}),
+            json!({"name": "没有 id 的项目"}),
+            json!({"url_id": "p3", "name": "项目三", "serviceAk": "meoo_project_service_v1.secret"}),
+        ]);
+        assert_eq!(
+            value["projects"],
+            json!([
+                {"urlId": "p1", "name": "p1"},
+                {"urlId": "p2", "name": "p2"},
+                {"urlId": "p3", "name": "项目三"},
+            ])
+        );
+        // 上游其余字段（密钥 / 环境 / 额度）一个都不能漏出去
+        assert!(!value.to_string().contains("meoo_project_service_v1"));
+    }
+
+    #[test]
+    fn project_summaries_of_empty_list_is_empty_envelope() {
+        assert_eq!(project_summaries(&[]), json!({"projects": []}));
+    }
 }

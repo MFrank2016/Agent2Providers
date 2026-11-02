@@ -184,8 +184,11 @@ pub fn reasoning_patch(level: &str, model: &str) -> agent2api_provider_protocol:
             reason: "未配置思考等级".to_string(),
         };
     }
+    // `qwen3.8-flash` 是目录里的默认 / 最便宜模型，兜底表里也标了
+    // `supportsReasoning: true`：漏掉它等于让用户在最常用的模型上选不动思考档位。
     let supports = model.starts_with("deepseek-v4")
         || model.starts_with("glm-5.2")
+        || model.starts_with("qwen3.8-flash")
         || model.starts_with("qwen3.8-max")
         || model == "qwen3.7-max";
     if supports {
@@ -334,6 +337,7 @@ mod tests {
         for model in [
             "deepseek-v4-pro-0813",
             "glm-5.2",
+            "qwen3.8-flash",
             "qwen3.8-max-0902",
             "qwen3.7-max",
         ] {
@@ -353,5 +357,18 @@ mod tests {
             reasoning_patch("  ", "deepseek-v4-pro-0813"),
             proto::ReasoningPatch::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_the_default_flash_model() {
+        // 目录对 qwen3.8-flash 声明 supportsReasoning: true，而它正是默认 /
+        // 最便宜的那条 —— 漏掉它会让用户在最常用的模型上选不动思考档位。
+        match reasoning_patch("high", "qwen3.8-flash") {
+            proto::ReasoningPatch::Set { field, value } => {
+                assert_eq!(field, "reasoning_effort");
+                assert_eq!(value, serde_json::json!("high"));
+            }
+            other => panic!("qwen3.8-flash 应注入 reasoning_effort，实际 {other:?}"),
+        }
     }
 }

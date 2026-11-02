@@ -309,21 +309,78 @@ impl Provider for MeooProvider {
 
     // ── 管理动作 ──────────────────────────────────────────────
 
-    /// `auth.methods`：把登录方式交给网关动态渲染（不在网关里写死 Meoo 的表单）。
+    /// 管理动作：`auth.methods`（登录方式）+ `project.list`（只读项目列表）。
+    ///
+    /// `project.list` 是「项目管理界面」的替代品：只读、只回 `urlId` / `name`，
+    /// 见 [`control::project_summaries`] 的字段边界。
     fn admin_action<'a>(
         &'a self,
-        _ctx: &'a PluginCtx,
-        _account: &'a str,
+        ctx: &'a PluginCtx,
+        account: &'a str,
         action: &'a str,
         _payload: &'a Value,
     ) -> SendFuture<'a, Value> {
         Box::pin(async move {
-            if action == "auth.methods" {
-                return Ok(login::auth_methods());
+            match action {
+                "auth.methods" => Ok(login::auth_methods()),
+                "project.list" => list_project_summaries(ctx, account)
+                    .await
+                    .map_err(GatewayError::into_message),
+                other => Err(format!("Meoo 没有实现管理动作「{other}」")),
             }
-            Err(format!("Meoo 没有实现管理动作「{action}」"))
         })
     }
+}
+
+/// 控制面 access token 的提前续期窗口（`project.list` 是一次短请求）。
+const PROJECT_TOKEN_MARGIN_MS: i64 = 60 * 1000;
+
+/// `project.list` 的实体：读账号 → （必要时）续期 → 拉项目 → 只留 `urlId`/`name`。
+///
+/// 控制面认 **OAuth access token**，手动 AK 账号（`refreshToken` 为空）没有控制面
+/// 身份 —— 直接给一句能照着做的 400，而不是发空 Bearer 换一个「登录已失效」的 401。
+async fn list_project_summaries(ctx: &PluginCtx, account: &str) -> Result<Value, GatewayError> {
+    let record = crate::store::record(ctx, ID, account).await?;
+    let cred = credentials::from_secret(&crate::store::secret_view(&record));
+    if cred.refresh_token.is_empty() {
+        return Err(GatewayError::with_status(
+            400,
+            "Meoo 项目管理需要浏览器登录账号（只有项目服务 AK 的账号不能列出项目）",
+        ));
+    }
+    let api_base = if cred.api_base.is_empty() {
+        endpoints::api_base()
+    } else {
+        cred.api_base.clone()
+    };
+    let access_token = if project_token_expiring(&cred, crate::http::now_ms()) {
+        // 只刷一轮（与 `usage::query` 同一口径）：续期会顺带解析项目服务 AK，
+        // 而列项目并不需要 AK —— 因此续期失败时先看新令牌在不在，令牌有了就
+        // 继续；令牌仍为空才把续期错误交出去。
+        let refreshed = refresh::ensure_service_ak(ctx, account, true).await;
+        let record = crate::store::record(ctx, ID, account).await?;
+        let next = credentials::from_secret(&crate::store::secret_view(&record));
+        if next.access_token.is_empty() {
+            return Err(refreshed.err().unwrap_or_else(|| {
+                GatewayError::with_status(
+                    401,
+                    "Meoo 账号没有 OAuth 访问令牌，请用「浏览器登录」重新添加账号",
+                )
+            }));
+        }
+        next.access_token
+    } else {
+        cred.access_token.clone()
+    };
+    let projects = control::list_projects(ctx, &api_base, &access_token).await?;
+    Ok(control::project_summaries(&projects))
+}
+
+/// 控制面令牌该不该先续期：空令牌一定续期；`expiresAt = 0` 判不出来，
+/// **不算**临期（宁可让上游回 401，也不要每列一次项目就轮换 refresh_token）。
+fn project_token_expiring(cred: &credentials::MeooCredentials, now: i64) -> bool {
+    cred.access_token.is_empty()
+        || (cred.expires_at > 0 && cred.expires_at - now < PROJECT_TOKEN_MARGIN_MS)
 }
 
 /// 账号显示名：用户备注（非空白）> 表单里的备注 > 「Meoo 秒悟 <AK 尾号>」。
@@ -357,6 +414,26 @@ mod tests {
         assert!(!meta.capabilities.checkin);
         assert!(!meta.capabilities.claims);
         assert!(!meta.default_models.is_empty());
+    }
+
+    #[test]
+    fn project_list_refreshes_only_when_token_is_blank_or_expiring() {
+        let mut cred = credentials::from_secret(&serde_json::json!({
+            "accessToken": "a",
+            "refreshToken": "r",
+            "expiresAt": 1_000_000
+        }));
+        // 还剩两分钟：不续期（列项目是一次短请求）
+        assert!(!project_token_expiring(&cred, 1_000_000 - 120_000));
+        // 进入 60 秒窗口：续期
+        assert!(project_token_expiring(&cred, 1_000_000 - 30_000));
+        // 空令牌：一定续期
+        cred.access_token.clear();
+        assert!(project_token_expiring(&cred, 1_000_000 - 120_000));
+        // expiresAt = 0 判不出来：不当作临期
+        cred.access_token = "a".into();
+        cred.expires_at = 0;
+        assert!(!project_token_expiring(&cred, 1_000_000));
     }
 
     #[test]

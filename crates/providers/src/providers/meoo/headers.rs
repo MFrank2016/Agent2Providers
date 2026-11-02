@@ -150,6 +150,21 @@ mod tests {
     }
 
     #[test]
+    fn control_headers_carry_cli_and_bearer() {
+        let headers = control_headers("token");
+        // 控制面必须带全 CLI 三件套 + Bearer + JSON 声明
+        assert!(headers.contains(&("X-Meoo-Client".into(), "cli".into())));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "X-Meoo-CLI-Version" && !value.trim().is_empty()));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "X-Meoo-Request-Id" && value.starts_with("cli_req_")));
+        assert!(headers.contains(&("Authorization".into(), "Bearer token".into())));
+        assert!(headers.contains(&("Content-Type".into(), "application/json".into())));
+    }
+
+    #[test]
     fn gateway_headers_include_cli_and_bearer() {
         let headers = gateway_headers_with(
             "meoo_project_service_v1.x",
