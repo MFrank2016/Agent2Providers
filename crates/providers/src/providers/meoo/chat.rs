@@ -44,6 +44,13 @@ use crate::errors::GatewayError;
 
 use super::{credentials, endpoints, headers};
 
+/// 「AK 类型错了」的统一提示（对话前拒绝与上游 401 共用同一句，避免两处措辞分叉）。
+const AK_TYPE_HINT: &str = "Meoo 项目服务 AK 类型不正确：请使用 meoo_project_service_v1.*，\
+                           不要用 meoo_ak_* 用户 Key";
+
+/// 项目服务 AK 的固定前缀（用户 API Key 是 `meoo_ak_*`，前缀不同、用途也不同）。
+const SERVICE_AK_PREFIX: &str = "meoo_project_service_v1.";
+
 /// 准备一次上游调用。
 ///
 /// `_client_stream` 只保留签名（网关把客户端偏好一并传来），**不参与判断**：
@@ -59,6 +66,13 @@ pub fn build_plan(
             401,
             "Meoo 账号缺少项目服务 AK，请重新登录或填写 AK",
         ));
+    }
+    // 宿主会把上游错误归一成 `{code, message}`，`error.code` 恒不存在 ——
+    // `SERVICE_AK_FORMAT_INVALID` 那半条判据在对话链路上可能读不到。所以
+    // 「AK 类型不对」必须在这里就拒掉：刷新救不了错误的前缀，只会把一句
+    // 可操作的提示拖成一次无意义的重试。
+    if !cred.service_ak.starts_with(SERVICE_AK_PREFIX) {
+        return Err(GatewayError::with_status(401, AK_TYPE_HINT));
     }
     let mut payload = body.clone();
     if let Some(object) = payload.as_object_mut() {
@@ -115,9 +129,7 @@ pub fn classify(status: u16, body: &Value) -> agent2api_provider_protocol::Error
         {
             return ErrorClass::Fatal {
                 status: 401,
-                message: "Meoo 项目服务 AK 类型不正确：请使用 meoo_project_service_v1.*，\
-                          不要用 meoo_ak_* 用户 Key"
-                    .to_string(),
+                message: AK_TYPE_HINT.to_string(),
                 upstream_code: code,
             };
         }
@@ -223,13 +235,47 @@ mod tests {
             401,
             &json!({"error":{"message":"SERVICE_AK_FORMAT_INVALID"}}),
         );
-        assert!(matches!(class, proto::ErrorClass::Fatal { .. }));
+        match class {
+            proto::ErrorClass::Fatal {
+                status,
+                ref message,
+                ..
+            } => {
+                assert_eq!(status, 401);
+                assert!(message.contains("meoo_project_service_v1"));
+            }
+            other => panic!("AK 类型错误必须是 Fatal 401，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_normalized_format_invalid_is_fatal() {
+        // 宿主把上游错误归一成 `{code, message}`：`error.code` 恒不存在，
+        // 只剩顶层 message 能带出 SERVICE_AK_FORMAT_INVALID。
+        let class = classify(
+            401,
+            &json!({"code": null, "message": "SERVICE_AK_FORMAT_INVALID"}),
+        );
+        match class {
+            proto::ErrorClass::Fatal {
+                status,
+                ref message,
+                ..
+            } => {
+                assert_eq!(status, 401);
+                assert!(message.contains("meoo_project_service_v1"));
+            }
+            other => panic!("归一后的 AK 类型错误必须是 Fatal 401，实际 {other:?}"),
+        }
     }
 
     #[test]
     fn quota_is_quota_limited() {
         let class = classify(429, &json!({"error":{"message":"积分不足"}}));
-        assert!(matches!(class, proto::ErrorClass::QuotaLimited { .. }));
+        match class {
+            proto::ErrorClass::QuotaLimited { status, .. } => assert_eq!(status, 429),
+            other => panic!("积分不足必须是 QuotaLimited，实际 {other:?}"),
+        }
     }
 
     #[test]
@@ -257,6 +303,21 @@ mod tests {
         .expect_err("没有项目服务 AK 必须拒绝");
         assert_eq!(error.status_code, 401);
         assert!(error.message.contains("项目服务 AK"));
+    }
+
+    #[test]
+    fn non_project_service_ak_is_rejected_locally() {
+        // 用户 Key（meoo_ak_*）拿去打模型网关只会 401，且宿主归一错误体后
+        // 上游那句 SERVICE_AK_FORMAT_INVALID 可能读不到 —— 对话前就拒掉。
+        let error = build_plan(
+            &json!({"serviceAk":"meoo_ak_123","projectUrlId":"p1"}),
+            &json!({"model":"qwen3.8-flash"}),
+            true,
+        )
+        .expect_err("非项目服务 AK 必须拒绝");
+        assert_eq!(error.status_code, 401);
+        assert!(error.message.contains("meoo_project_service_v1"));
+        assert!(error.message.contains("meoo_ak_"));
     }
 
     #[test]
