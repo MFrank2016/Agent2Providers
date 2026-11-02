@@ -22,9 +22,11 @@
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
 // ── 为什么整份 `allow(dead_code)` ───────────────────────────
-// 本模块先于 `login.rs` / `refresh.rs` / `mod.rs` 的接线落地（Task 5 才接入
-// `normalize_account`），此刻只有单测在用。删掉等于让接线那一步重写一遍
-// 凭证解析 —— 而「哪些字段进公开视图」正是最不该重写的地方。
+// 本模块已由 `login.rs` / `refresh.rs` / `mod.rs` 接线，但凭证快照里仍有几个
+// 字段（`gateway_base`、`username` 的部分用法）要等目录 / 对话链路（Task 7-8）
+// 才会被读。整份关掉告警，是为了让「快照字段」保持完整一套 —— 缺字段会让
+// 后面那条链路各自再解析一遍 secret，而「哪些字段进公开视图」正是最不该重写
+// 的地方。
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
@@ -75,6 +77,29 @@ pub fn from_secret(secret: &Value) -> MeooCredentials {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     }
+}
+
+/// 提前刷新的窗口：access token 剩不到 5 分钟就当作临期。
+///
+/// 5 分钟是「一次对话可能跑得比它久」与「别把刷新打成轮询」之间的折中：
+/// 窗口太小，长对话会在半途撞上 401；窗口太大，每次转发前都在续期。
+const REFRESH_MARGIN_MS: i64 = 5 * 60 * 1000;
+
+/// 这个账号此刻需不需要动网络（续期 / 重新解析 AK）。
+///
+/// ── 三条判据 ────────────────────────────────────────────────
+/// 1. 项目服务 AK 为空 —— 没有能拿去对话的 Bearer；
+/// 2. AK 属于的项目与当前项目不一致 —— 换了项目，旧 AK 打不动新项目；
+/// 3. access token 进入 5 分钟窗口（`expiresAt = 0` 表示判不出来，**不算**临期，
+///    宁可漏刷也不要凭猜测打上游）。
+///
+/// 三条都不成立时调用方一次请求都不该发 —— 这是转发路径上唯一的「省网络」
+/// 闸门。
+pub fn should_refresh(cred: &MeooCredentials, now: i64) -> bool {
+    if cred.service_ak.is_empty() || cred.service_ak_project_id != cred.project_url_id {
+        return true;
+    }
+    cred.expires_at > 0 && cred.expires_at - now < REFRESH_MARGIN_MS
 }
 
 /// 公开账号视图：**只**含展示字段与 `tokenTail`，不含任何 token / AK。

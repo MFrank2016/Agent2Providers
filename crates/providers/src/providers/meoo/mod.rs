@@ -156,6 +156,48 @@ impl Provider for MeooProvider {
         Ok(credentials::identity_of(secret))
     }
 
+    // ── 凭证 ──────────────────────────────────────────────────
+
+    /// 取对话 / 目录用的 Bearer：**项目服务 AK**，不是 OAuth access token。
+    ///
+    /// 网关把这里的返回值当上游 `Authorization` 用，所以绝不能返回控制面令牌
+    /// （它只对 Meoo 控制面有效，拿去打模型网关必然 401）。临期 / AK 缺失时
+    /// 内部会续期并重新解析 AK（见 `refresh::ensure_service_ak`）。
+    fn ensure_token<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, String> {
+        Box::pin(async move {
+            refresh::ensure_service_ak(ctx, account, false)
+                .await
+                .map_err(GatewayError::into_message)
+        })
+    }
+
+    /// 401 之后的强制刷新：跳过临期判定续期一次，并重新解析项目服务 AK。
+    ///
+    /// **只刷一轮**：网关重试一次、插件刷新一次，两边都不循环 —— `invalid_grant`
+    /// 归 401「请重新登录」，重试只会把 401 拖成超时。
+    fn refresh_token<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, String> {
+        Box::pin(async move {
+            refresh::ensure_service_ak(ctx, account, true)
+                .await
+                .map_err(GatewayError::into_message)
+        })
+    }
+
+    /// 临期判定：与 [`refresh::ensure_service_ak`] 用同一个判据（AK 缺失 / 项目
+    /// 不匹配 / access token 进入 5 分钟窗口）。
+    ///
+    /// 读不到账号时返回 `false`（与 `Provider` 的约定一致：判不出来宁可漏刷，
+    /// 也不要凭猜测去打上游或把维护链路变成一条稳定失败）。
+    fn token_expiring<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, bool> {
+        Box::pin(async move {
+            let Ok(record) = crate::store::record(ctx, ID, account).await else {
+                return Ok(false);
+            };
+            let cred = credentials::from_secret(&crate::store::secret_view(&record));
+            Ok(credentials::should_refresh(&cred, crate::http::now_ms()))
+        })
+    }
+
     // ── 登录（回调型）──────────────────────────────────────────
 
     /// 发起登录。`poll_interval_ms = 0`：这是**回调型**流程，网关不该起轮询
