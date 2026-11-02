@@ -80,6 +80,36 @@ impl Provider for MeooProvider {
         ID.to_string()
     }
 
+    // ── 数据面 ────────────────────────────────────────────────
+
+    /// 构造一次对话请求：Bearer 取**项目服务 AK**（不是 OAuth token）。
+    ///
+    /// 网关在调用前已走 `ensure_token`（续期 + 重新解析 AK），所以这里读到
+    /// 空 AK 说明账号本身没配好，直接 401 比发空 Bearer 更好懂。
+    fn build_chat<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: proto::ChatRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::ChatPlan> {
+        Box::pin(async move {
+            let record = crate::store::record(ctx, ID, &req.account)
+                .await
+                .map_err(GatewayError::into_message)?;
+            chat::build_plan(&crate::store::secret_view(&record), &req.body, req.stream)
+                .map_err(GatewayError::into_message)
+        })
+    }
+
+    /// 上游错误分类（判定顺序是契约，见 `chat.rs` 模块头）。
+    fn classify(&self, status: u16, body: &Value) -> proto::ErrorClass {
+        chat::classify(status, body)
+    }
+
+    /// 思考档位：只有声明支持 `reasoning_effort` 的模型才注入。
+    fn reasoning_patch(&self, level: &str, model: &str, _body: &Value) -> proto::ReasoningPatch {
+        chat::reasoning_patch(level, model)
+    }
+
     // ── 账号 ──────────────────────────────────────────────────
 
     /// 添加账号：手填项目服务 AK / 文本 JSON / 旧 meoo-proxy 配置导入。
