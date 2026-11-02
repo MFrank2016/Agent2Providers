@@ -250,6 +250,24 @@ impl Provider for MeooProvider {
         Box::pin(async move { Ok(models::refresh(ctx, account, force).await) })
     }
 
+    // ── 积分 ──────────────────────────────────────────────────
+
+    /// 积分余额：`/account/points` 是主读数（失败即失败），套餐 / 身份只降级。
+    ///
+    /// 手动 AK 账号没有 OAuth 身份，查不了积分 —— 这里给可操作的 400，
+    /// 见 `usage.rs` 模块头。签到 / 领取恒 false（官方 CLI 没有这两个动作）。
+    fn usage<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+    ) -> SendFuture<'a, proto::UsageReport> {
+        Box::pin(async move {
+            usage::query(ctx, account)
+                .await
+                .map_err(GatewayError::into_message)
+        })
+    }
+
     // ── 登录（回调型）──────────────────────────────────────────
 
     /// 发起登录。`poll_interval_ms = 0`：这是**回调型**流程，网关不该起轮询
