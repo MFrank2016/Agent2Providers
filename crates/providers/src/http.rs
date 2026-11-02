@@ -190,12 +190,19 @@ pub fn client_system_proxy() -> reqwest::Client {
 /// 返回 `(status, payload)`：**非 2xx 也返回**（不在这里判成败）——
 /// 各家对「哪些状态码算失败」的判据不同（魔搭用 200 + 业务位表达失败，
 /// Command Code 用 401/403），把判定权留给调用方。
+///
+/// 调用方 `headers` 里已经带了 `Accept` 时不再补默认值：reqwest 的
+/// `header()` 是**追加**语义，重复的 `Content-Type` 被 RFC 9110 禁止，
+/// 严格的端点会直接 400。
 pub async fn get_json(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
 ) -> Result<(u16, Value), String> {
-    let mut request = client.get(url).header("Accept", "application/json");
+    let mut request = client.get(url);
+    if !has_header(headers, "Accept") {
+        request = request.header("Accept", "application/json");
+    }
     for (key, value) in headers {
         request = request.header(key, value);
     }
@@ -206,17 +213,23 @@ pub async fn get_json(
 }
 
 /// 发一次 POST（JSON 体）并解析 JSON 响应。
+///
+/// 默认头与 [`get_json`] 同一条口径：调用方已经给了 `Accept` / `Content-Type`
+/// 就**不重复追加**（见那里的说明）。
 pub async fn post_json(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
     body: &Value,
 ) -> Result<(u16, Value), String> {
-    let mut request = client
-        .post(url)
-        .header("Accept", "application/json")
-        .header("Content-Type", "application/json")
-        .body(body.to_string());
+    let mut request = client.post(url);
+    if !has_header(headers, "Accept") {
+        request = request.header("Accept", "application/json");
+    }
+    if !has_header(headers, "Content-Type") {
+        request = request.header("Content-Type", "application/json");
+    }
+    let mut request = request.body(body.to_string());
     for (key, value) in headers {
         request = request.header(key, value);
     }
@@ -224,6 +237,13 @@ pub async fn post_json(
     let status = response.status().as_u16();
     let text = response.text().await.map_err(|error| describe(&error))?;
     Ok((status, parse_json(&text)))
+}
+
+/// 调用方头里是否已经有这个键（HTTP 头名大小写不敏感）。
+fn has_header(headers: &[(String, String)], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case(name))
 }
 
 /// 发一次 `application/x-www-form-urlencoded` POST 并解析 JSON 响应。
@@ -280,9 +300,17 @@ pub async fn post_stream(
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let text = response.text().await.unwrap_or_default();
-        return Ok(SseResponse { status, response: None, error_body: Some(text) });
+        return Ok(SseResponse {
+            status,
+            response: None,
+            error_body: Some(text),
+        });
     }
-    Ok(SseResponse { status, response: Some(response), error_body: None })
+    Ok(SseResponse {
+        status,
+        response: Some(response),
+        error_body: None,
+    })
 }
 
 /// [`post_stream`] 的结果。
@@ -303,7 +331,12 @@ impl SseResponse {
 
     /// 错误体的前 240 个字符（拼错误文案用）。
     pub fn error_head(&self) -> String {
-        self.error_body.as_deref().unwrap_or("").chars().take(240).collect()
+        self.error_body
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(240)
+            .collect()
     }
 }
 
@@ -375,7 +408,11 @@ pub async fn send_raw(
     } else {
         serde_json::from_str::<Value>(&text).ok()
     };
-    Ok(ApiResponse { status, ok, payload })
+    Ok(ApiResponse {
+        status,
+        ok,
+        payload,
+    })
 }
 
 /// 空体 / 非 JSON 一律给 `Value::Null`（与网关 `send_raw` 同口径）。
@@ -432,4 +469,103 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 起一个只收一次请求的裸 HTTP 服务：返回 (url, 拿原始请求文本的句柄)。
+    async fn serve_once() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("绑定回环端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受连接");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.expect("读请求");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                // 只要拿到请求头就够了，不必等 body 读完
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .expect("写响应");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{addr}/probe"), handle)
+    }
+
+    /// 请求头里某个名字出现几次（大小写不敏感）。
+    fn header_count(request: &str, name: &str) -> usize {
+        request
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .filter(|line| {
+                line.split(':')
+                    .next()
+                    .is_some_and(|key| key.eq_ignore_ascii_case(name))
+            })
+            .count()
+    }
+
+    #[test]
+    fn has_header_is_case_insensitive() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("ACCEPT".to_string(), "text/event-stream".to_string()),
+        ];
+        assert!(has_header(&headers, "Content-Type"));
+        assert!(has_header(&headers, "accept"));
+        assert!(!has_header(&headers, "Authorization"));
+    }
+
+    #[tokio::test]
+    async fn post_json_does_not_duplicate_caller_content_type() {
+        let (url, server) = serve_once().await;
+        // 故意用小写，验证去重是大小写不敏感的
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+        let (status, _) = post_json(
+            &client(None, "direct"),
+            &url,
+            &headers,
+            &serde_json::json!({"a": 1}),
+        )
+        .await
+        .expect("POST 应成功");
+        assert_eq!(status, 200);
+        let request = server.await.expect("服务端任务");
+        assert_eq!(header_count(&request, "content-type"), 1, "{request}");
+        assert_eq!(header_count(&request, "accept"), 1, "{request}");
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_duplicate_caller_accept() {
+        let (url, server) = serve_once().await;
+        let headers = vec![("ACCEPT".to_string(), "application/json".to_string())];
+        let (status, _) = get_json(&client(None, "direct"), &url, &headers)
+            .await
+            .expect("GET 应成功");
+        assert_eq!(status, 200);
+        let request = server.await.expect("服务端任务");
+        assert_eq!(header_count(&request, "accept"), 1, "{request}");
+    }
 }
