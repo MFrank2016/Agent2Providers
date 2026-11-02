@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-providers"
-description = "Agent2API 官方提供商插件包：22 家内置提供商实现"
+description = "Agent2API 官方提供商插件包：32 家内置提供商实现"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
