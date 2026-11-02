@@ -198,6 +198,28 @@ impl Provider for MeooProvider {
         })
     }
 
+    // ── 目录 ──────────────────────────────────────────────────
+
+    /// 当前模型清单：远程 `/models` 优先，5 分钟 TTL；失败沿用旧清单
+    /// （没有则静态兜底），见 `models.rs` 的负缓存说明。
+    fn models<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+    ) -> SendFuture<'a, proto::ModelList> {
+        Box::pin(async move { Ok(models::list(ctx, account).await) })
+    }
+
+    /// 刷新目录：`force = false` 时 TTL 内跳过；失败保留旧清单并回报原因。
+    fn refresh_models<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        account: &'a str,
+        force: bool,
+    ) -> SendFuture<'a, proto::RefreshOutcome> {
+        Box::pin(async move { Ok(models::refresh(ctx, account, force).await) })
+    }
+
     // ── 登录（回调型）──────────────────────────────────────────
 
     /// 发起登录。`poll_interval_ms = 0`：这是**回调型**流程，网关不该起轮询
