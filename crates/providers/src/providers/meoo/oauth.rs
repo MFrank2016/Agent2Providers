@@ -135,6 +135,23 @@ fn parse_token(payload: &Value) -> Result<TokenBundle, GatewayError> {
     })
 }
 
+/// 换票失败的状态码映射。
+///
+/// ── 为什么不能一律归 401 ────────────────────────────────────
+/// 401 的语义是「这个授权码 / 这次登录不成立」，上层据此让用户**重新登录**。
+/// 上游 5xx / 429 是「此刻换不了票」，归成 401 会让一次上游抖动变成
+/// 「请重新登录」，用户照着做还是失败。所以只有 4xx（授权码过期、
+/// `invalid_grant`、`invalid_client`）留 401，5xx / 429 归 502。
+fn exchange_failure(status: u16, code: &str) -> GatewayError {
+    if status >= 500 || status == 429 {
+        return GatewayError::with_status(
+            502,
+            format!("Meoo 换票暂时不可用（HTTP {status}），请稍后重试：{code}"),
+        );
+    }
+    GatewayError::with_status(401, format!("Meoo 换票被拒（HTTP {status}）：{code}"))
+}
+
 /// 用授权码换令牌（`application/x-www-form-urlencoded`，不带 CLI 头）。
 pub async fn exchange_code(
     ctx: &PluginCtx,
@@ -159,12 +176,9 @@ pub async fn exchange_code(
     .await
     .map_err(|error| GatewayError::with_status(502, format!("Meoo 换票失败：{error}")))?;
     if !(200..300).contains(&status) {
-        return Err(GatewayError::with_status(
-            401,
-            format!(
-                "Meoo 换票被拒（HTTP {status}）：{}",
-                payload.get("error").and_then(Value::as_str).unwrap_or("")
-            ),
+        return Err(exchange_failure(
+            status,
+            payload.get("error").and_then(Value::as_str).unwrap_or(""),
         ));
     }
     parse_token(&payload)
@@ -278,5 +292,17 @@ mod tests {
         let (code, state) = parse_callback("bare-code", "").expect("裸 code 应接受");
         assert_eq!(code, "bare-code");
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn exchange_maps_upstream_outage_to_502() {
+        // 上游抖动不能被读成「该重新登录了」
+        assert_eq!(exchange_failure(503, "").status_code, 502);
+        assert_eq!(exchange_failure(500, "upstream").status_code, 502);
+        assert_eq!(exchange_failure(429, "").status_code, 502);
+        // 4xx 才是「这枚授权码不成立」
+        assert_eq!(exchange_failure(400, "invalid_grant").status_code, 401);
+        assert_eq!(exchange_failure(401, "invalid_client").status_code, 401);
+        assert!(exchange_failure(502, "").message.contains("暂时不可用"));
     }
 }

@@ -25,7 +25,10 @@ pub mod refresh;
 pub mod usage;
 
 use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{Provider, ProviderMeta};
+use agent2api_provider_sdk::{PluginCtx, Provider, ProviderMeta, SendFuture};
+use serde_json::Value;
+
+use crate::errors::GatewayError;
 
 /// provider id（`pack.json` 必须写同一个）。
 pub const ID: &str = "meoo";
@@ -75,6 +78,143 @@ impl Provider for MeooProvider {
 
     fn provider_id(&self) -> String {
         ID.to_string()
+    }
+
+    // ── 账号 ──────────────────────────────────────────────────
+
+    /// 添加账号：手填项目服务 AK / 文本 JSON / 旧 meoo-proxy 配置导入。
+    ///
+    /// 三种来源最后都收敛到同一份 secret 形状（`credentials::account_view` /
+    /// `identity_of` 认的那套字段），所以「从哪儿来」只影响解析，不影响落库。
+    /// 手填与文本导入都会**立即探活**：一个打不通的 AK 落进账号库，只会在
+    /// 第一次对话时变成一个看不懂的上游错误。
+    fn normalize_account<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        input: proto::NormalizeInput,
+    ) -> SendFuture<'a, proto::NormalizedAccount> {
+        Box::pin(async move {
+            match &input.source {
+                proto::NormalizeSource::Manual { payload } => {
+                    let manual = credentials::parse_manual(payload)?;
+                    models::validate_service_ak(
+                        ctx,
+                        &manual.service_ak,
+                        manual.project_url_id.as_deref(),
+                    )
+                    .await
+                    .map_err(GatewayError::into_message)?;
+                    let project = manual.project_url_id.clone().unwrap_or_default();
+                    let tail = crate::store::token_tail(&manual.service_ak);
+                    let name = input
+                        .name
+                        .clone()
+                        .or(manual.name)
+                        .unwrap_or_else(|| format!("Meoo 秒悟 {tail}"));
+                    let secret = serde_json::json!({
+                        "serviceAk": manual.service_ak,
+                        "projectUrlId": project.clone(),
+                        "serviceAkProjectId": project,
+                        "accessToken": "",
+                        "refreshToken": "",
+                        "expiresAt": 0,
+                    });
+                    // 备注名（表单里的「备注名」/ 导入时指定的名字）要进公开视图：
+                    // 网关优先用 `public.name` 作为账号显示名，缺了它这一步，
+                    // 用户填的备注名会被 `account_view` 的派生名盖掉。
+                    let mut public = credentials::account_view(&secret);
+                    if let Some(object) = public.as_object_mut() {
+                        object.insert("name".to_string(), Value::String(name));
+                    }
+                    Ok(proto::NormalizedAccount {
+                        public,
+                        identity: credentials::identity_of(&secret),
+                        secret,
+                        desktop: false,
+                    })
+                }
+                // 文本文件既可能是「整份 JSON」，也可能只是裸 AK 一行。
+                // 先按 JSON 解析，失败就当成 AK 文本 —— 两种形态用户都会给。
+                proto::NormalizeSource::FileText { content, .. } => {
+                    let payload = serde_json::from_str::<Value>(content.trim())
+                        .unwrap_or_else(|_| serde_json::json!({ "serviceAk": content.trim() }));
+                    let input = proto::NormalizeInput {
+                        source: proto::NormalizeSource::Manual { payload },
+                        ..input.clone()
+                    };
+                    self.normalize_account(ctx, input).await
+                }
+                proto::NormalizeSource::FileBase64 { .. } => {
+                    Err("Meoo 不支持二进制文件导入，请粘贴项目服务 AK 或 JSON".to_string())
+                }
+                proto::NormalizeSource::Desktop => login::normalize_legacy(ctx, &input).await,
+            }
+        })
+    }
+
+    fn account_view(&self, secret: &Value) -> Result<Value, String> {
+        Ok(credentials::account_view(secret))
+    }
+
+    fn account_identity(&self, secret: &Value) -> Result<String, String> {
+        Ok(credentials::identity_of(secret))
+    }
+
+    // ── 登录（回调型）──────────────────────────────────────────
+
+    /// 发起登录。`poll_interval_ms = 0`：这是**回调型**流程，网关不该起轮询
+    /// （回调由 `/oauth/callback` 或用户粘贴地址送达，见 `login.rs`）。
+    fn login_start<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        _method: &'a str,
+        payload: &'a Value,
+    ) -> SendFuture<'a, proto::LoginStart> {
+        Box::pin(async move { login::begin_login(ctx, payload) })
+    }
+
+    /// 回调换票（浏览器落在网关 `/oauth/callback`，或用户粘贴整条回调 URL）。
+    fn login_callback<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        callback: proto::LoginCallback,
+    ) -> SendFuture<'a, proto::LoginPoll> {
+        Box::pin(async move { login::exchange_callback(ctx, callback).await })
+    }
+
+    /// 回调型流程没有「轮询」语义：等回调本身，永远是 Pending。
+    fn login_poll<'a>(
+        &'a self,
+        _ctx: &'a PluginCtx,
+        _flow: &'a str,
+    ) -> SendFuture<'a, proto::LoginPoll> {
+        Box::pin(async { Ok(proto::LoginPoll::Pending { hint: None }) })
+    }
+
+    /// 取消：清掉待回调表项，同一 state 不能再换票。
+    fn login_cancel<'a>(&'a self, _ctx: &'a PluginCtx, flow: &'a str) -> SendFuture<'a, ()> {
+        Box::pin(async move {
+            login::cancel(flow);
+            Ok(())
+        })
+    }
+
+    // ── 管理动作 ──────────────────────────────────────────────
+
+    /// `auth.methods`：把登录方式交给网关动态渲染（不在网关里写死 Meoo 的表单）。
+    fn admin_action<'a>(
+        &'a self,
+        _ctx: &'a PluginCtx,
+        _account: &'a str,
+        action: &'a str,
+        _payload: &'a Value,
+    ) -> SendFuture<'a, Value> {
+        Box::pin(async move {
+            if action == "auth.methods" {
+                return Ok(login::auth_methods());
+            }
+            Err(format!("Meoo 没有实现管理动作「{action}」"))
+        })
     }
 }
 
