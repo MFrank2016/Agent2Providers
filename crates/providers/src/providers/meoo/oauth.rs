@@ -139,17 +139,17 @@ fn parse_token(payload: &Value) -> Result<TokenBundle, GatewayError> {
 ///
 /// ── 为什么不能一律归 401 ────────────────────────────────────
 /// 401 的语义是「这个授权码 / 这次登录不成立」，上层据此让用户**重新登录**。
-/// 上游 5xx / 429 是「此刻换不了票」，归成 401 会让一次上游抖动变成
-/// 「请重新登录」，用户照着做还是失败。所以只有 4xx（授权码过期、
-/// `invalid_grant`、`invalid_client`）留 401，5xx / 429 归 502。
+/// 上游 5xx / 429 是「此刻换不了票」，3xx 是「地址/网关配置不对」，两者归成
+/// 401 都会让用户照着「重新登录」做一遍还是失败。所以只有 4xx（授权码过期、
+/// `invalid_grant`、`invalid_client`；429 除外）留 401，其余一律 502。
 fn exchange_failure(status: u16, code: &str) -> GatewayError {
-    if status >= 500 || status == 429 {
-        return GatewayError::with_status(
-            502,
-            format!("Meoo 换票暂时不可用（HTTP {status}），请稍后重试：{code}"),
-        );
+    if (400..=499).contains(&status) && status != 429 {
+        return GatewayError::with_status(401, format!("Meoo 换票被拒（HTTP {status}）：{code}"));
     }
-    GatewayError::with_status(401, format!("Meoo 换票被拒（HTTP {status}）：{code}"))
+    GatewayError::with_status(
+        502,
+        format!("Meoo 换票暂时不可用（HTTP {status}），请稍后重试：{code}"),
+    )
 }
 
 /// 用授权码换令牌（`application/x-www-form-urlencoded`，不带 CLI 头）。
@@ -300,9 +300,14 @@ mod tests {
         assert_eq!(exchange_failure(503, "").status_code, 502);
         assert_eq!(exchange_failure(500, "upstream").status_code, 502);
         assert_eq!(exchange_failure(429, "").status_code, 502);
-        // 4xx 才是「这枚授权码不成立」
+        // 3xx 是地址/网关配置问题，也不是「授权码不成立」
+        assert_eq!(exchange_failure(302, "").status_code, 502);
+        assert_eq!(exchange_failure(304, "").status_code, 502);
+        // 只有 4xx（429 除外）才是「这枚授权码 / 这次客户端不成立」
         assert_eq!(exchange_failure(400, "invalid_grant").status_code, 401);
         assert_eq!(exchange_failure(401, "invalid_client").status_code, 401);
+        assert_eq!(exchange_failure(403, "forbidden").status_code, 401);
+        assert_eq!(exchange_failure(404, "").status_code, 401);
         assert!(exchange_failure(502, "").message.contains("暂时不可用"));
     }
 }

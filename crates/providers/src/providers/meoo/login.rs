@@ -116,7 +116,10 @@ pub fn begin_login(ctx: &PluginCtx, payload: &Value) -> Result<proto::LoginStart
     let pkce = oauth::create_pkce();
     let state = {
         let mut bytes = [0u8; 32];
-        let _ = getrandom::getrandom(&mut bytes);
+        // 随机源失败必须中止：全零 state 是可预测的，而 state 是公开回调
+        // 端点唯一的所有权凭证 —— 常量 state 等于让任何人把**自己的** Meoo
+        // 账号绑到这台网关的登录任务上。
+        getrandom::getrandom(&mut bytes).map_err(|error| format!("无法生成登录 state：{error}"))?;
         use base64::Engine as _;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     };
@@ -169,7 +172,7 @@ pub async fn exchange_callback(
     };
     if !state.is_empty() && state != callback.flow {
         return Ok(proto::LoginPoll::Failed {
-            message: "回调 state 与当前登录任务不匹配".to_string(),
+            message: "回调 state 与当前登录任务不匹配，请重新发起登录".to_string(),
         });
     }
     let token = match oauth::exchange_code(

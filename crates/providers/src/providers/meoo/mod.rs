@@ -106,11 +106,7 @@ impl Provider for MeooProvider {
                     .map_err(GatewayError::into_message)?;
                     let project = manual.project_url_id.clone().unwrap_or_default();
                     let tail = crate::store::token_tail(&manual.service_ak);
-                    let name = input
-                        .name
-                        .clone()
-                        .or(manual.name)
-                        .unwrap_or_else(|| format!("Meoo 秒悟 {tail}"));
+                    let name = account_name(input.name.as_deref(), manual.name, &tail);
                     let secret = serde_json::json!({
                         "serviceAk": manual.service_ak,
                         "projectUrlId": project.clone(),
@@ -218,6 +214,18 @@ impl Provider for MeooProvider {
     }
 }
 
+/// 账号显示名：用户备注（非空白）> 表单里的备注 > 「Meoo 秒悟 <AK 尾号>」。
+///
+/// 空串 / 全空白必须当成「没填」：`Some("")` 会被当成用户指定的名字，账号
+/// 列表里就会出现一个没有名字的账号。
+fn account_name(input_name: Option<&str>, manual_name: Option<String>, tail: &str) -> String {
+    input_name
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .or(manual_name)
+        .unwrap_or_else(|| format!("Meoo 秒悟 {tail}"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -237,5 +245,19 @@ mod tests {
         assert!(!meta.capabilities.checkin);
         assert!(!meta.capabilities.claims);
         assert!(!meta.default_models.is_empty());
+    }
+
+    #[test]
+    fn blank_remark_name_falls_back() {
+        // 空白备注名不能把账号显示名清空
+        assert_eq!(account_name(Some("   "), None, "abcd"), "Meoo 秒悟 abcd");
+        assert_eq!(account_name(Some(""), None, "abcd"), "Meoo 秒悟 abcd");
+        assert_eq!(account_name(None, None, "abcd"), "Meoo 秒悟 abcd");
+        // 有备注名时用备注名；表单里的备注优先于自动名
+        assert_eq!(account_name(Some("我的项目"), None, "abcd"), "我的项目");
+        assert_eq!(
+            account_name(Some(" "), Some("表单名".to_string()), "abcd"),
+            "表单名"
+        );
     }
 }
