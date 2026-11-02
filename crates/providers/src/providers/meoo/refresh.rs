@@ -136,6 +136,16 @@ pub async fn ensure_service_ak(
     }
 }
 
+/// 这一轮是否需要（重新）解析项目服务 AK。
+///
+/// ── 为什么 `force` 也必须算进来 ──────────────────────────────
+/// `force = true` 是网关在 401 之后发起的强制刷新。AK 被上游吊销 / 轮换时，
+/// 账号里的 AK 仍然「非空且项目匹配」—— 只看那两条会把同一份死 AK 再发一次，
+/// 用户等到的只有「重新登录」，而真正该做的是拿新 access token 重新解析 AK。
+pub fn needs_ak(force: bool, cred: &credentials::MeooCredentials) -> bool {
+    force || cred.service_ak.is_empty() || cred.service_ak_project_id != cred.project_url_id
+}
+
 /// leader 的实体：重读 → 续期 → 解析 AK → 比较再写。
 async fn refresh_leader(
     ctx: &PluginCtx,
@@ -149,7 +159,7 @@ async fn refresh_leader(
     if !force && !credentials::should_refresh(&cred, crate::http::now_ms()) {
         return Ok(cred.service_ak);
     }
-    let needs_ak = cred.service_ak.is_empty() || cred.service_ak_project_id != cred.project_url_id;
+    let needs_ak = needs_ak(force, &cred);
     // 缺项目 id 时**先**报错再续期：续期会轮换 refresh_token，为一个注定拼不出
     // `/projects/{id}/cloud/environment` 的请求把令牌换掉，等于白白丢掉一次
     // 有效的登录态。
@@ -282,6 +292,33 @@ mod tests {
         assert!(!credentials::should_refresh(
             &credential(0, "meoo_project_service_v1.x", "p"),
             now
+        ));
+    }
+
+    #[test]
+    fn force_always_resolves_the_project_service_ak() {
+        // 401 之后的强制刷新：AK 看着「有效」也可能是被上游吊销 / 轮换掉的那一份。
+        // 只看「AK 非空 + 项目匹配」会把死 AK 一直发出去，用户只会被告知重新登录。
+        let fresh = 1_000_000 + 30 * 60 * 1000;
+        let valid = credential(fresh, "meoo_project_service_v1.x", "p");
+        assert!(needs_ak(true, &valid), "force 必须重新解析 AK");
+        assert!(!needs_ak(false, &valid), "非强制且 AK 有效时不该重解析");
+    }
+
+    #[test]
+    fn needs_ak_covers_missing_and_mismatched_ak() {
+        let fresh = 1_000_000 + 30 * 60 * 1000;
+        // AK 为空
+        assert!(needs_ak(false, &credential(fresh, "", "p")));
+        // AK 属于别的项目（换项目后必须重新解析）
+        assert!(needs_ak(
+            false,
+            &credential(fresh, "meoo_project_service_v1.x", "other")
+        ));
+        // 强制刷新即使 AK 有效也要解析
+        assert!(needs_ak(
+            true,
+            &credential(fresh, "meoo_project_service_v1.x", "p")
         ));
     }
 
