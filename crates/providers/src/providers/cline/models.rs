@@ -1,15 +1,15 @@
 //! Cline 模型目录：两个额度池 + 远程刷新 + 对下游的友好名。
 //!
-//! ── 上游模型 id 的形状（实测，2026-09）───────────────────────
+//! ── 上游模型 id 的形状（实测，2026-11）───────────────────────
 //! `GET {apiBase}/ai/cline/recommended-models` 返回四个组（实测）：
 //!
 //! ```jsonc
 //! {
-//!   "recommended": [{"id":"openai/gpt-6-astra","name":"gpt-6-astra",...}, ...],  // 4 条
-//!   "free":        [{"id":"cline-free/deepseek-v4.1-flash","name":"Deepseek-v4.1-Flash",...},
-//!                   {"id":"z-ai/glm-5.3-flash","name":"glm-5.3-flash",...}, ...],  // 5 条，**混着无前缀条目**
-//!   "clinePass":   [{"id":"cline-pass/glm-5.3","name":"cline-pass/glm-5.3",...}, ...], // 14 条
-//!   "clineCloud":  [{"id":"cline-cloud/glm-5.3",...}]                                  // 3 条
+//!   "recommended": [{"id":"openai/gpt-6-astra","name":"gpt-6-astra",...}, ...],  // 6 条
+//!   "free":        [{"id":"reflection/beam-free","name":"Beam",...},
+//!                   {"id":"nvidia/nemotron-3.5-lightning-free",...}, ...],       // 4 条，**混着无前缀条目**
+//!   "clinePass":   [{"id":"cline-pass/glm-5.3","name":"cline-pass/glm-5.3",...}, ...], // 15 条
+//!   "clineCloud":  [{"id":"cline-cloud/deepseek-v4.1-flash",...}]                      // 1 条
 //! }
 //! ```
 //!
@@ -21,13 +21,13 @@
 //!   1. **`clinePass`（订阅池）**：id 一律带 `cline-pass/` 前缀。
 //!      这是 ClinePass 订阅用户的实际可用集，也是我们主要在意的那个池。
 //!   2. **`free`（免费池）**：**只有部分条目带 `cline-free/` 前缀** ——
-//!      实测 5 条里有 2 条是别家的裸 id（`z-ai/glm-5.3-flash`、
-//!      `poolside/laguna-s-2.1:free`）。那两条**同样是免费池成员**（实测用
+//!      实测 4 条里有 2 条是别家的裸 id（`reflection/beam-free`、
+//!      `nvidia/nemotron-3.5-lightning-free`）。那两条**同样是免费池成员**（实测用
 //!      免费账号打它们返回 200，走 OpenRouter 那类通道转售），只是上游用了
 //!      承载方的裸 id 而没加自己的通道前缀。**因此归池必须看分组，不能看前缀**
 //!      —— 早先按 `pool_of(id)` 猜前缀，把这 2 条错判进订阅池，而订阅池没有
 //!      账号时整家不广告，于是它们在界面上**彻底消失**（只显示 3 条的那个 bug）。
-//!   3. **`recommended`**：上游的「推荐位」（4 条），与上面两组**有重叠**
+//!   3. **`recommended`**：上游的「推荐位」（6 条），与上面两组**有重叠**
 //!      （如 `moonshotai/kimi-k3` 与 pass 池的 `cline-pass/kimi-k3` 是同一个模型
 //!      的不同通道）。收录它们会让 `/v1/models` 里出现一批「同一个模型的两种
 //!      写法」，而它们的计费通道不同、可用性也不同 —— 用户点名哪一个就走哪一个，
@@ -263,7 +263,7 @@ fn refreshed_at_slot() -> &'static Mutex<i64> {
 /// 静态兜底清单（远程刷新失败 / 尚未刷新时用）。
 ///
 /// ── 为什么这几条 ────────────────────────────────────────────
-/// 取自实测的 recommended-models 响应（2026-09）：订阅池 4 条主力 + 免费池 3 条，
+/// 取自实测的 recommended-models 响应（2026-11）：订阅池 5 条主力 + 免费池 4 条，
 /// 覆盖「装上就能用」的最低限度。**不抄全**：上游那个清单会变（模型上下架频繁），
 /// 抄全了只会得到一份很快过时的表；这里只留稳定存在的主力模型，
 /// 其余靠远程刷新补齐。
@@ -277,15 +277,14 @@ const FALLBACK_MODELS: &[(&str, &str, Pool, i64, bool)] = &[
     ( "cline-pass/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (ClinePass)", Pool::Pass, 1_000_000, true),
     ( "cline-pass/deepseek-v4-pro",     "DeepSeek V4 Pro (ClinePass)",   Pool::Pass, 128_000, true),
     ( "cline-pass/qwen3.8-max",         "Qwen3.8 Max (ClinePass)",       Pool::Pass, 256_000, true),
-    ( "cline-free/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (免费)",    Pool::Free, 1_000_000, true),
-    ( "cline-free/muse-spark-1.3-contributor", "Muse Spark 1.3 (免费)", Pool::Free, 200_000, true),
-    ( "cline-free/solar-pro4",          "Solar Pro 4 (免费)",            Pool::Free, 128_000, false),
-    // 免费池的裸 id 两条（**不带 `cline-free/` 前缀**，见模块头第 2 条）。
-    // 兜底表也收它们：上游目录接口拉不到时，它们同样是「装上就能用」的免费模型，
-    // 少了这两条会让免费池在离线/未刷新时又退回「只有 3 个」的旧观感。
-    // 上下文窗口取自 Cline 官方目录（`@cline/llms` 的 `cline` 块实测值）。
-    ( "z-ai/glm-5.3-flash",             "GLM-5.3-Flash (免费)",          Pool::Free, 1_310_720, true),
-    ( "poolside/laguna-s-2.1:free",     "Laguna S 2.1 (免费)",           Pool::Free, 262_144, true),
+    ( "reflection/beam-free",           "Beam (免费)",                   Pool::Free, 1_048_576, true),
+    ( "cline-free/nemotron-3.5-super-vl","Nemotron 3.5 Super VL (免费)",  Pool::Free, 1_000_000, true),
+    ( "nvidia/nemotron-3.5-lightning-free","Nemotron 3.5 Lightning (免费)", Pool::Free, 1_000_000, true),
+    ( "cline-free/solar-mini4",         "Solar Mini 4 (免费)",            Pool::Free,   524_288, true),
+    // 免费池的裸 id 两条（**不带 `cline-free/` 前缀**，见模块头第 2 条）：
+    // `reflection/beam-free` 与 `nvidia/nemotron-3.5-lightning-free`。
+    // 兜底表也收它们：上游目录接口拉不到时，它们同样是「装上就能用」的免费模型。
+    // 上下文窗口取自 2026-11 实测（`maxInputTokens` 覆盖层用同一组值）。
 ];
 
 /// 上游 id 的**通道前缀** → 池（按 id 前缀猜的兜底判据）。
@@ -325,8 +324,8 @@ pub fn pool_of(model_id: &str) -> Pool {
 /// 上游 id → 对下游的**友好名**（这条模型该有的去前缀写法）；没有可剥的返回 None。
 ///
 /// ── 按池判，而不是只看 id（本次修复）─────────────────────────
-/// 免费池里混着**不带通道前缀**的条目（`z-ai/glm-5.3-flash`、
-/// `poolside/laguna-s-2.1:free`，见模块头第 2 条）：它们的通道由分组给出，
+/// 免费池里混着**不带通道前缀**的条目（`reflection/beam-free`、
+/// `nvidia/nemotron-3.5-lightning-free`，见模块头第 2 条）：它们的通道由分组给出，
 /// id 上只有承载方的厂商前缀。这类条目同样该有一个能直接敲的短名字，于是：
 ///   - 带通道前缀（`cline-free/` / `cline-pass/` / `cline-cloud/`）→ 剥通道前缀；
 ///   - **免费池**里不带通道前缀、但带厂商前缀（`z-ai/…`）→ 剥厂商前缀；
@@ -335,7 +334,7 @@ pub fn pool_of(model_id: &str) -> Pool {
 ///     `anthropic/claude-opus-5` 是不同模型），剥掉会造出上游不存在的名字。
 ///
 /// ── 为什么只在免费池剥厂商前缀（别类推到别处）─────────────────
-/// `z-ai/glm-5.3-flash` 里的 `z-ai/` 是「这条免费额度由谁承载」，与
+/// `nvidia/nemotron-3.5-lightning-free` 里的 `nvidia/` 是「这条免费额度由谁承载」，与
 /// `cline-free/` 属于同一层含义（都是**通道**）；而 `openai/gpt-6-astra` 里的
 /// `openai/` 是模型本身是谁（**身份**）。剥通道前缀才得到用户认得的名字，
 /// 剥身份前缀会造出上游不存在的名字。免费池这 2 条恰好把承载方写在了通道位上。
@@ -364,7 +363,7 @@ pub fn friendly_alias(pool: Pool, model_id: &str) -> Option<&str> {
     // 没有 `/` 的 id（上游本来就给的友好名）无需映射。
     if pool == Pool::Free {
         let (_, rest) = id.split_once('/')?;
-        // 再剥变体后缀 `:free`（`poolside/laguna-s-2.1:free` → `laguna-s-2.1`）——
+        // 再剥变体后缀 `:free`（`vendor/model:free` → `model`）——
         // Cline 自己的展示名归一化也是这么做的（它的 `oK()` 就是去掉 `:free`
         // 与 ` (free)` 后缀）。留着后缀会得到一个客户端难敲的名字。
         let rest = rest.strip_suffix(":free").unwrap_or(rest);
