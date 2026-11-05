@@ -138,3 +138,64 @@ fn split_control_error(message: &str) -> Option<proto::WireError> {
     let metadata = serde_json::to_string(&error.metadata).ok()?;
     Some(proto::WireError::with_code(error.message, format!("{HTTP_CODE_PREFIX}{metadata}")))
 }
+
+#[cfg(test)]
+mod control_roundtrip {
+    //! 控制面错误过线时**状态码不许丢**。
+    //!
+    //! ── 这条为什么值得单独立个测试 ────────────────────────────
+    //! 插件侧的 `GatewayError` 带 `status_code`，但控制面的错误通道只有一个
+    //! `String`。丢掉状态码的后果不是「文案不好看」，而是网关那条按状态码分支
+    //! 的链路**静默失效**：`core::usage_query::query_usage_inner` 靠
+    //! `status_code == 401` 决定「刷新后重试一次」，靠刷新也失败来决定落
+    //! `usage_credential_dead` 并按 1 小时退避。状态码一丢（比如误用
+    //! `into_message` 而不是 `into_control_message`），两条分支都永不触发，
+    //! 死凭证会被按 60 秒间隔无限重打 —— 生产实测一晚上几十条告警。
+    //!
+    //! 所以这里钉住的是**往返**：状态码 → 信封 → 网关可还原的 `provider_http:`
+    //! 元数据。插件作者改错映射时，这条会立刻红。
+
+    use super::*;
+
+    /// 网关 `plugin_host::errors::control_error` 读的就是这个前缀与形状。
+    fn gateway_metadata(error: &proto::WireError) -> Option<ErrorMetadata> {
+        let payload = error.code.as_deref()?.strip_prefix(HTTP_CODE_PREFIX)?;
+        serde_json::from_str(payload).ok()
+    }
+
+    #[test]
+    fn a_401_survives_the_wire_and_stays_a_401() {
+        let message = control_error(401, "Trae 积分接口返回 401", None, None);
+        let wire = to_wire_error(message);
+        let metadata = gateway_metadata(&wire).expect("控制面错误必须带 provider_http 元数据");
+        assert_eq!(401, metadata.status, "网关靠这个数走「刷新后重试一次」");
+        assert!(
+            !wire.code.as_deref().unwrap_or("").starts_with(CONTROL_ERROR_PREFIX),
+            "信封必须是网关认识的 provider_http，不是插件内部的 CONTROL_ERROR"
+        );
+    }
+
+    #[test]
+    fn the_upstream_code_and_business_code_are_carried_along() {
+        let message = control_error(429, "额度用尽", Some("usage_not_configured".to_string()), Some(1005));
+        let wire = to_wire_error(message);
+        let metadata = gateway_metadata(&wire).expect("同上");
+        assert_eq!(429, metadata.status);
+        assert_eq!(Some("usage_not_configured".to_string()), metadata.code, "前端按 code 判定「未配置」");
+        assert_eq!(Some(1005), metadata.upstream_code, "限额事件要记上游真码");
+    }
+
+    #[test]
+    fn a_message_without_an_envelope_is_still_internal() {
+        // 反面：`into_message` 那条路（只留文案）过线后只能是 INTERNAL ——
+        // 这正是本次修复的 bug 的形态。留着它当对照，免得有人「简化」回
+        // 只传文案的写法。
+        let wire = to_wire_error("Trae 积分接口返回 401: …".to_string());
+        assert_eq!(
+            Some(proto::WireError::INTERNAL),
+            wire.code.as_deref(),
+            "裸文案过线没有状态码"
+        );
+        assert!(gateway_metadata(&wire).is_none(), "裸文案不带任何状态信息");
+    }
+}

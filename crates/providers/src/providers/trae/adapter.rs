@@ -287,16 +287,34 @@ impl Provider for TraeProvider {
         })
     }
 
-    /// 额度读数（形状契约见 trait 文档；本家的实现细节在 `usage.rs`）。
+    /// 额度来源声明（形状契约见 trait 文档）。
     fn quota_sources(&self, report: &Value) -> Vec<Value> {
         crate::quota::sources(&self.meta().id, report)
     }
 
+    /// 额度读数（形状契约见 trait 文档；本家的实现细节在 `usage.rs`）。
+    ///
+    /// ── 为什么这里必须是 `into_control_message` 而不是 `into_message` ──
+    /// `usage.rs` 对上游 401（`code:1001` 会话被作废）返回的是一条**带状态码**
+    /// 的错误（`GatewayError::with_status(401, …)`），而控制面的错误通道只有
+    /// 一个 `String`。`into_message` 只留文案，网关那一侧就再也看不出这是 401 ——
+    /// `core::usage_query::query_usage_inner` 的两条分支都靠 `status_code == 401`
+    /// 判定，状态码一丢它们**永远不触发**：
+    ///
+    ///   1. 「401 → 刷新后同账号重试一次」不会发生（本可自愈的临期账号也失去这条路径）；
+    ///   2. 「刷新也失败 → 落 `usage_credential_dead` 并按 1 小时退避」不会发生，
+    ///      自动查询按 60 秒间隔**无限重打**同一个死凭证 —— 生产实测一个被上游
+    ///      吊销的账号每 ~67 秒产生一条 `余额查询失败`，一晚上几十条。
+    ///
+    /// `into_control_message` 把状态码 / 业务码 / 上游码封进 `provider_http:`
+    /// 信封，网关的 `plugin_host::errors::control_error` 会原样还原成
+    /// `GatewayError`（含 401）。与 CodeArts 的余额链同一处置 —— 两处口径
+    /// 分叉过一次（见 `provider-sdk::errors` 的 `control_roundtrip` 用例），别再来一次。
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             super::usage::query_usage(ctx, account)
                 .await
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 

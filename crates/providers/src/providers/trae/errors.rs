@@ -89,6 +89,32 @@ pub fn msg_indicates_input_too_large(message: &str) -> bool {
 /// 免得同一个码在两条路径上得到两种语义）。
 pub const PLAN_LIMIT_CODES: [i64; 2] = [1005, 4008];
 
+/// 风控软拒：`4010` + `We're sorry, access denied. Please wait and try again later.`
+///
+/// ── 判据与证据（2026-11-05 一手实测，别再靠猜）───────────────
+/// 一个刚网页登录成功的 SOLO 账号，当天时间线：
+///   13:32 登录成功（JWT `exp` 到 11-19，refreshToken 齐全）
+///   13:32 登录后立刻签到 → `9074`「当前参与用户太多」
+///   13:33–14:27 **对话正常**（该账号接走了 20 次请求）
+///   14:27:26 起对话流内开始回 `event:error {"code":4010,…access denied}`
+///            —— 连续 21 次，每次都排在队列第一位被先试一遍
+///   14:35 起 refreshToken 也被吊销（`ExchangeToken` 回 `20101` invalid），
+///            余额 / 对话全部 401 `code:1001`
+/// 即 **4010 是「这个账号被风控」的前兆**，不是请求级错误：同一份 body 换个
+/// 账号（`用户9787157519` / `用户55010956550`）当场就能出字。
+///
+/// ── 为什么必须归账号级（以前归 `Client` 的代价）──────────────
+/// 旧表把 4010 落进 `ErrorKind::Client` → `Fatal`：**不冷却、不换号**。
+/// 于是编排层每来一个请求都先撞它一次，白等 3–5 秒才轮到下一个账号。
+/// 归到 `SoftRate` 后走 `Limit::punish` 的同一条链（落冷却标记、换号），
+/// 没有新增分支。
+///
+/// ── 为什么不是 `PlanLimit`（12 小时硬冷却）────────────────────
+/// 上游文案是「wait and try again later」，属**时间窗**语义；而且该账号在
+/// 14:27 之后拿到的始终是 4010 而非 1005，说明额度没被判耗尽。12 小时硬
+/// 冷却会把一个只是短时被拦的账号关一整天，代价明显过大。
+pub const ACCESS_DENIED_CODE: i64 = 4010;
+
 /// 模型在当前 function 不可用。
 pub fn is_model_mismatch_code(code: i64) -> bool {
     matches!(code, 4001 | 4023)
@@ -118,6 +144,12 @@ pub fn stream_error_kind(code: i64, message: &str) -> ErrorKind {
         return ErrorKind::SessionDead;
     }
     if code == 4011 {
+        return ErrorKind::SoftRate;
+    }
+    // 风控软拒（4010）：账号级，冷却后换号。放在过大判定之后是有意的 ——
+    // 上游有时把超大输入也包在 4010 里，而那种情况换任何账号都会被拒，
+    // 冷却健康账号只会把一次坏请求摊成一串被罚的账号。
+    if code == ACCESS_DENIED_CODE {
         return ErrorKind::SoftRate;
     }
     ErrorKind::Client
@@ -196,4 +228,88 @@ pub fn error_event_fields(data: &Value) -> (i64, String) {
         .unwrap_or_default()
         .to_string();
     (code, message)
+}
+
+#[cfg(test)]
+mod access_denied_vectors {
+    //! `4010` 的分类，钉在**抓下来的真实报文**上。
+    //!
+    //! 证据出处：2026-11-05 一个刚登录成功的 SOLO 账号，对话流里连续 21 次
+    //! 回同一条 `event:error`（见 [`ACCESS_DENIED_CODE`] 的注释）。手写一份
+    //! 「想象中的错误体」等于把猜测当证据，所以这里逐字照抄上游原文。
+
+    use super::*;
+
+    /// 上游原文（`event:error` 的 data 段，逐字）。
+    const ACCESS_DENIED_MESSAGE: &str =
+        "We're sorry, access denied. Please wait and try again later.";
+
+    #[test]
+    fn access_denied_is_an_account_level_soft_rate_not_a_fatal() {
+        // 本次修复的核心：旧表把它归 `Client` → `Fatal`，于是**不冷却、不换号**，
+        // 每个请求都先撞它一次（实测白等 3–5 秒 × 21 次）。
+        assert_eq!(
+            ErrorKind::SoftRate,
+            stream_error_kind(ACCESS_DENIED_CODE, ACCESS_DENIED_MESSAGE),
+            "4010 是账号级风控软拒，必须冷却后换号"
+        );
+        assert!(!ErrorKind::SoftRate.is_request_level(), "它不是请求级错误");
+    }
+
+    #[test]
+    fn the_non_stream_path_agrees_with_the_stream_one() {
+        // 同一个码在两条路径上必须同档 —— 否则流式请求会被换号、非流式不会。
+        // `classify` 把 `code != 0` 的正文交给 `stream_error_kind`，这条钉住
+        // 那层转交没被写断。
+        let body =
+            format!("{{\"code\":{ACCESS_DENIED_CODE},\"message\":\"{ACCESS_DENIED_MESSAGE}\"}}");
+        assert_eq!(
+            ErrorKind::SoftRate,
+            classify(400, &body),
+            "非 2xx 正文里的 4010 与流内 error 帧走同一张表"
+        );
+    }
+
+    #[test]
+    fn input_too_large_still_wins_over_access_denied() {
+        // 上游有时把超大输入也包进 4010；那种情况换谁都被拒，不能冷却账号。
+        assert_eq!(
+            ErrorKind::InputTooLarge,
+            stream_error_kind(
+                ACCESS_DENIED_CODE,
+                "prompt is too long: 200000 tokens > 128000 maximum"
+            ),
+            "过大判定必须排在 4010 之前"
+        );
+    }
+
+    #[test]
+    fn neighbouring_codes_keep_their_own_buckets() {
+        // 回归护栏：4010 的加入不得改变既有几档。
+        for code in PLAN_LIMIT_CODES {
+            assert_eq!(
+                ErrorKind::PlanLimit,
+                stream_error_kind(code, "quota exhausted")
+            );
+        }
+        assert_eq!(
+            ErrorKind::SessionDead,
+            stream_error_kind(1001, "not able to authenticate you")
+        );
+        assert_eq!(
+            ErrorKind::SoftRate,
+            stream_error_kind(4011, "too many requests")
+        );
+        assert_eq!(
+            ErrorKind::ModelUnavailable,
+            stream_error_kind(4001, "channel unavailable")
+        );
+        assert_ne!(ACCESS_DENIED_CODE, 4011, "4010 与 4011 是两个不同的码");
+    }
+
+    #[test]
+    fn an_unknown_code_is_still_a_client_error() {
+        // 回归护栏：只认 4010 这一个码，别把整个 4xxx 段都算成风控。
+        assert_eq!(ErrorKind::Client, stream_error_kind(4002, "something else"));
+    }
 }
