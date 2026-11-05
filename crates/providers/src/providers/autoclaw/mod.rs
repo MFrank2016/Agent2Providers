@@ -592,9 +592,18 @@ impl Provider for AutoClawProvider {
                         .get("captchaVerifyParam")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let (flow, auth_url) = web_login::start_oauth(region, vendor, captcha)
-                        .await
-                        .map_err(GatewayError::into_message)?;
+                    let local_browser = payload
+                        .get("localBrowser")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let navigate_base = payload
+                        .get("navigateBase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let (flow, auth_url) =
+                        web_login::start_oauth(region, vendor, captcha, local_browser, navigate_base)
+                            .await
+                            .map_err(GatewayError::into_message)?;
                     Ok(web_login::start_payload(&flow, &auth_url))
                 }
                 "login.oauth-callback" => {

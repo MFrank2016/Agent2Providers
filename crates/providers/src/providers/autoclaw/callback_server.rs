@@ -105,6 +105,17 @@ impl CallbackListener {
         ))
     }
 
+    /// 远程/容器形态：只持有投递通道，不占登记端口、不起 accept 循环。
+    /// 用户粘贴的回调仍由 `deliver` 投进流程表（与真实 HTTP 回调共用出口）。
+    pub(super) fn channel_only(sender: mpsc::UnboundedSender<String>) -> Self {
+        let (shutdown, _receiver) = watch::channel(false);
+        Self {
+            port: 0,
+            shutdown,
+            sender: std::sync::Mutex::new(Some(sender)),
+        }
+    }
+
     /// 这一轮占到的端口（拼 `navigate_uri` 用）。
     pub(super) fn port(&self) -> u16 {
         self.port
