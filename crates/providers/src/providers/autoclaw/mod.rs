@@ -6,7 +6,7 @@
 //! （`X-Product` / `X-Client-Type` / `X-Tm` …）与 `X-Authorization`。因此
 //! 本插件的形态是**无状态转发**：一次 HTTP 请求 = 一次生成。
 //!
-//! ── 三道上游闸（每一条都是实测出来的，改之前先读对应模块）──────
+//! ── 四道上游闸（每一条都是实测出来的，改之前先读对应模块）──────
 //! ```text
 //!   1. `max_tokens` 小正整数（<10000）→ 406 空响应体（#58 / #69）
 //!      归一在 `normalize_max_tokens`，只对本家生效。
@@ -14,6 +14,8 @@
 //!      `prompt::normalize` 前置 OpenClaw 身份前缀 + 改写外来身份句。
 //!   3. `X-Harness-Type: zcode` → 403 pay-view / 406
 //!      转发头里**不发**这个头（刷新头里保留，两处口径不同且都有实测依据）。
+//!   4. 请求体带 `metadata` → 500 `parse response failed`（issue #388）
+//!      出站前删掉整个 `metadata`（见 `strip_client_metadata`）。
 //! ```
 //!
 //! ── 两个地区是两个 provider（与网关内置版同构）────────────────
@@ -224,7 +226,16 @@ impl Provider for AutoClawProvider {
         Box::pin(async move {
             let record = crate::store::record(ctx, self.region.provider_id(), &req.account)
                 .await?;
-            let token = crate::store::pick(&record, &["token", "accessToken", "access_token"]);
+            // ── 取出来先剥 `Bearer ` 前缀（issue #386）────────────────
+            // 存储里的 token 可能自带前缀（登录响应原样落库的值就是这样），
+            // 而下面拼头时会再加一个 —— 不剥就是 `Bearer Bearer eyJ…`，上游按
+            // 空格切分后拿到的凭证不是合法 JWT，恒定 401 `Invalid token`。
+            // 判据与 `refresh::signed_auth_headers` 出口那一处同一套（那边覆盖
+            // 刷新 / 余额 / 签到 / 目录），两条链路都收口才不会有漏网路径。
+            let token = crate::crypto::strip_bearer(&crate::store::pick(
+                &record,
+                &["token", "accessToken", "access_token"],
+            ));
             if token.is_empty() {
                 return Err("AutoClaw 账号缺少 accessToken，无法转发".to_string());
             }
@@ -260,6 +271,9 @@ impl Provider for AutoClawProvider {
             }
             normalize_max_tokens(&mut out_body);
             prompt::normalize(&mut out_body);
+            // 最后一道：删掉客户端自带的 `metadata`（第四道闸，issue #388）。
+            // 放在 prompt::normalize 之后，因为它只动 `messages`，两者互不干扰。
+            strip_client_metadata(&mut out_body);
             Ok(ChatPlan::chat(
                 format!(
                     "{}/chat/completions",
@@ -328,8 +342,7 @@ impl Provider for AutoClawProvider {
             let refreshed = refresh::ensure_fresh(&previous)
                 .await
                 .map_err(GatewayError::into_message)?;
-            persist_refresh(ctx, &previous, &refreshed).await;
-            Ok(refreshed.token)
+            persist_refresh(ctx, &previous, &refreshed).await.map_err(GatewayError::into_control_message)
         })
     }
 
@@ -345,8 +358,7 @@ impl Provider for AutoClawProvider {
             let refreshed = refresh::refresh(&previous, true)
                 .await
                 .map_err(GatewayError::into_message)?;
-            persist_refresh(ctx, &previous, &refreshed).await;
-            Ok(refreshed.token)
+            persist_refresh(ctx, &previous, &refreshed).await.map_err(GatewayError::into_control_message)
         })
     }
 
@@ -426,8 +438,11 @@ impl Provider for AutoClawProvider {
 
     /// 查积分 + 订阅（`balance.rs`：资产钱包 + `subscribe-info` 合成一次调用）。
     ///
-    /// 两条链路都在 userapi 域、都带那套 `X-Auth-Sign` 签名头 + Bearer，且源
-    /// 实现是裸 fetch（不走账号代理）—— 与刷新接口同一取舍。
+    /// 两条链路都在 userapi 域，带同一套 `X-Auth-Sign` 签名头与 Bearer。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        crate::quota::sources(&self.meta().id, report)
+    }
+
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             balance::query_usage(self.region, ctx, account)
@@ -445,7 +460,7 @@ impl Provider for AutoClawProvider {
         Box::pin(async move {
             let claim = checkin::claim_daily_signin(ctx, self.region, account)
                 .await
-                .map_err(GatewayError::into_message)?;
+                .map_err(GatewayError::into_control_message)?;
             Ok(checkin_report_of(&claim))
         })
     }
@@ -576,9 +591,18 @@ impl Provider for AutoClawProvider {
                         .get("captchaVerifyParam")
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    let (flow, auth_url) = web_login::start_oauth(region, vendor, captcha)
-                        .await
-                        .map_err(GatewayError::into_message)?;
+                    let local_browser = payload
+                        .get("localBrowser")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let navigate_base = payload
+                        .get("navigateBase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let (flow, auth_url) =
+                        web_login::start_oauth(region, vendor, captcha, local_browser, navigate_base)
+                            .await
+                            .map_err(GatewayError::into_message)?;
                     Ok(web_login::start_payload(&flow, &auth_url))
                 }
                 "login.oauth-callback" => {
@@ -639,7 +663,8 @@ async fn resolve_credentials(
 /// 自己的刷新互相顶掉。
 ///
 /// ── 三个写盘前提 ──────────────────────────────────────────
-///   1. **没刷新就不写**：token 与刷新前逐字相同直接返回；
+///   1. **没刷新就不写**：token 与刷新前逐字相同就跳过写库 —— 但**旧 token 已
+///      过期时不能当成功**（上游对失效的 refresh_token 会宽容地回旧值，见下）；
 ///   2. **只在刷新成功时写**：调用方只在 `Ok` 分支调用本函数；
 ///   3. **刷新了也要比较-再写**：`store::save` 在同一把账号锁内确认记录里仍是
 ///      刷新前那份凭证才写入。期间用户重导入 / 删除 / 换号、或另一轮刷新先
@@ -648,53 +673,68 @@ async fn persist_refresh(
     ctx: &PluginCtx,
     previous: &AutoClawCredentials,
     refreshed: &AutoClawCredentials,
-) {
+) -> Result<String, GatewayError> {
     if refreshed.origin != CredentialOrigin::AccountStore {
-        return;
+        return Ok(refreshed.token.clone());
     }
+    // 上游原样回了旧 token：可能是服务端没轮换，也可能是 refresh_token 已废、
+    // 它宽容地回了旧值。先看这一轮**到底有没有尝试刷新** —— 没进临期窗口时
+    // `ensure_fresh` 根本不请求上游，`refreshed` 就是 `previous` 的克隆，同值
+    // 是正常的（也保住「过期时间未知的凭证不因缺字段而报错」这条既有行为）。
+    // 真尝试过刷新时：旧 token 尚未过期就还能用；已过期 / 拿不到有效期才算
+    // 失败 —— 再返回成功，凭证维护会每轮记「已自动刷新」却推不动有效期，
+    // 账号静默失效（issue #22）。`expires_at` 与 `now_ms()` 都是毫秒。
     if refreshed.token == previous.token && refreshed.refresh_token == previous.refresh_token {
-        return;
+        let attempted = previous.is_expiring();
+        let still_valid = refreshed
+            .expires_at
+            .is_some_and(|expires_at| expires_at > logging::now_ms() as f64);
+        if !attempted || still_valid {
+            return Ok(refreshed.token.clone());
+        }
+        return Err(GatewayError::with_status(
+            409,
+            "AutoClaw 刷新未返回新 token（上游按旧值返回），请重新登录该账号",
+        ));
     }
     let account_id = refreshed.id.as_str();
-    let Ok(record) = crate::store::record(ctx, refreshed.region.provider_id(), account_id).await
-    else {
-        return;
-    };
-    // 记录里必须仍是刷新前那份凭证，否则说明别处已经换过（不回写）
-    let current_token = crate::store::pick(&record, &["token", "accessToken"]);
-    let current_refresh = crate::store::pick(&record, &["refreshToken"]);
-    if current_token != previous.token || current_refresh != previous.refresh_token {
-        logging::verbose(
-            "[AutoClaw]",
-            &format!("账号 {account_id} 的刷新结果已过期（凭证已被更换），未回写"),
-        );
-        return;
+    let record = crate::store::record(ctx, refreshed.region.provider_id(), account_id).await?;
+    // 两份凭证必须按相同规则解析；原始 secret 仍用于后续的原子条件写入。
+    let current = credentials::credentials_from_record(&record, refreshed.region)?;
+    if current.token != previous.token || current.refresh_token != previous.refresh_token {
+        return Ok(current.token);
     }
     let mut next = crate::store::secret_view(&record);
-    let fields: Vec<(&str, Value)> = vec![
+    // 两套键同时写：`token` / `tokenExpiresAt` 是本插件与旧投影的口径，
+    // `accessToken` / `expiresAt` 是网关账号存储与界面读的口径
+    // （`account_store::state` 读 `accessToken` / `expiresAt`）。只写前者时
+    // 网关那两栏读不到，回写等于白写（issue #22）。
+    let mut fields: Vec<(&str, Value)> = vec![
         ("token", Value::String(refreshed.token.clone())),
+        (
+            "accessToken",
+            Value::String(refreshed.token.clone()),
+        ),
         (
             "refreshToken",
             Value::String(refreshed.refresh_token.clone()),
         ),
         ("deviceId", Value::String(refreshed.device_id.clone())),
     ];
-    let mut fields = fields;
     if let Some(expires_at) = refreshed.expires_at {
         fields.push(("tokenExpiresAt", crate::json::json_number(expires_at)));
+        fields.push(("expiresAt", crate::json::json_number(expires_at)));
     }
     next = crate::store::with_fields(&next, &fields);
-    match crate::store::save(ctx, account_id, &crate::store::secret_view(&record), &next).await {
-        Ok(true) => {}
-        Ok(false) => logging::verbose(
-            "[AutoClaw]",
-            &format!("账号 {account_id} 的刷新结果未写入（记录已变，本次仍用新令牌）"),
-        ),
-        Err(error) => logging::verbose(
-            "[AutoClaw]",
-            &format!("账号 {account_id} 刷新结果回写失败: {}", error.message),
-        ),
+    if crate::store::save(ctx, account_id, &crate::store::secret_view(&record), &next).await? {
+        return Ok(refreshed.token.clone());
     }
+    let latest = crate::store::record(ctx, refreshed.region.provider_id(), account_id).await?;
+    let current = credentials::credentials_from_record(&latest, refreshed.region)?;
+    if current.token == previous.token && current.refresh_token == previous.refresh_token {
+        return Err(GatewayError::with_status(409, "AutoClaw 续期结果未能落盘，请重新登录该账号"));
+    }
+    Ok(current.token)
 }
 
 // ─── 请求头 ────────────────────────────────────────────────────
@@ -785,8 +825,35 @@ fn normalize_max_tokens(body: &mut Value) {
     }
 }
 
-// ─── 账号视图 ──────────────────────────────────────────────────
+/// 删掉客户端自带的 `metadata` 字段（第四道上游闸，issue #388）。
+///
+/// ── 为什么必须删，而不是「转换」────────────────────────────────
+/// 上游 `/chat/completions` 收到 `metadata` 时直接回 **500
+/// `parse response failed`** —— 注意这不是 4xx 参数错误，而是一个看起来像
+/// 「服务端坏了」的 500。于是客户端侧的表现为：调参数、换模型、重试全都没用，
+/// 因为坏的是请求体的**形状**而不是内容。issue #388 的实测是「同一完整请求
+/// 仅删除 metadata 就恢复 200」，因此这里选择整段删除而不是挑字段改写 ——
+/// 上游既然不认这个字段，改写它没有意义，反而可能引入下一个未知闸门。
+///
+/// ── 这个字段是哪来的 ────────────────────────────────────────
+/// ZCode 等客户端为标识设备 / 账号 / 会话，会自动在请求里塞
+/// `metadata.user_id`（JSON 字符串）。网关原样透传，插件再原样转发 ——
+/// 这条链路上没有任何一环认为它有问题，直到上游 500。
+///
+/// ── 为什么整段删而不是只删 `user_id` ─────────────────────────
+/// `metadata` 是 OpenAI 协议里**可选**的归属字段，对生成结果没有任何影响
+/// （上游不用它做计费或路由 —— 真要那样的话它会解析而不是 500）。
+/// 只删 `user_id` 会留下一个空对象或其它未知子键，仍然要赌上游认不认；
+/// 整段删是唯一确定安全的形态。
+///
+/// 只影响本家的出站请求体：入站的 `req.body` 是克隆来的，其它家不受影响。
+fn strip_client_metadata(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("metadata");
+    }
+}
 
+// ─── 账号视图 ──────────────────────────────────────────────────
 /// 账号公开视图（界面账号页读的那几个键）。
 ///
 /// ── 为什么邮箱很重要（别删）─────────────────────────────────
@@ -824,7 +891,13 @@ pub(super) fn account_view(region: Region, secret: &Value) -> Value {
         "region": region.provider_id(),
         "canRefresh": !crate::store::pick(secret, &["refreshToken"]).is_empty(),
     });
-    if let Some(expires_at) = secret.get("tokenExpiresAt").and_then(Value::as_f64) {
+    // 与 `credentials_from_record` 同一口径：`expiresAt`（网关）与
+    // `tokenExpiresAt`（旧投影 / 本插件）都认，都在时取较新的那个。
+    let expires_at = ["tokenExpiresAt", "expiresAt"]
+        .iter()
+        .filter_map(|key| secret.get(*key).and_then(Value::as_f64))
+        .reduce(f64::max);
+    if let Some(expires_at) = expires_at {
         if let Some(object) = view.as_object_mut() {
             object.insert(
                 "tokenExpiresAt".to_string(),

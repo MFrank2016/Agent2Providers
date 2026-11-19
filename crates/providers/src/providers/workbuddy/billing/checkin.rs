@@ -45,9 +45,7 @@ const DAILY_CHECKIN_PATH: &str = "/v2/billing/meter/daily-checkin";
 /// `session` 是 `session_of_record` 折出来的会话形状（`auth` / `account` /
 /// `endpoint` / `proxy`）—— 与网关 `BillingService` 拿到的会话同一形态。
 pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
-    let proxy = session
-        .get("proxy")
-        .and_then(|value| serde_json::from_value::<agent2api_provider_protocol::WireProxy>(value.clone()).ok());
+    let proxy = super::super::contract::proxy_of(session)?;
     let result = call::call(
         "POST",
         DAILY_CHECKIN_PATH,
@@ -88,6 +86,10 @@ pub(crate) async fn claim(session: &Value) -> Result<Value, GatewayError> {
                 "msg".to_string(),
                 Value::String(result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string())),
             );
+            let message = failure.get("msg").and_then(Value::as_str).unwrap_or("");
+            let already = !(message.contains("可能") || message.contains("未能") || message.contains("失败"))
+                && (message.contains("已签到") || message.contains("已领取"));
+            failure.insert("alreadyCompleted".to_string(), Value::Bool(already));
             Ok(Value::Object(failure))
         }
         // 请求本身没打成（超时 / 断连 / 401 / 非 2xx）—— 这是真的失败

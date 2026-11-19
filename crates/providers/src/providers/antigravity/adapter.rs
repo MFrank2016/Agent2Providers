@@ -202,7 +202,10 @@ impl Provider for AntigravityProvider {
                 .into_message());
             }
             // 对外 id → 上游真名（表见 models.rs；对不上的原样透传）
-            let wire_model = models::upstream_model_id(requested);
+            let effort = crate::model_rules::read_client_level(&req.body);
+            let wire_model = super::argon::resolve_model(requested, effort.as_deref())
+                .map(str::to_string)
+                .unwrap_or_else(|| models::upstream_model_id(requested));
             if wire_model != requested {
                 logging::verbose(
                     "[Antigravity]",
@@ -250,6 +253,30 @@ impl Provider for AntigravityProvider {
                 upstream: proto::UpstreamKind::Gemini,
             })
         })
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        true
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        true
+    }
+
+    fn build_image_edit<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: agent2api_provider_sdk::images::ImageRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::images::ImagePlan> {
+        Box::pin(super::image_generation::build_edit(ctx, req))
+    }
+
+    fn build_image<'a>(
+        &'a self,
+        ctx: &'a PluginCtx,
+        req: agent2api_provider_sdk::images::ImageRequest,
+    ) -> SendFuture<'a, agent2api_provider_sdk::images::ImagePlan> {
+        Box::pin(super::image_generation::build(ctx, req))
     }
 
     /// 上游错误分类（规格 §7 的映射表 + 本仓的四档口径）。
@@ -509,7 +536,8 @@ impl Provider for AntigravityProvider {
                     ),
                 }
             }
-            Ok(models::refresh(&credentials.access_token, &project_id, proxy.as_ref(), force).await)
+            let account_id = record.get("id").and_then(Value::as_str).unwrap_or(account);
+            Ok(models::refresh(account_id, &credentials.access_token, &project_id, proxy.as_ref(), force).await)
         })
     }
 
@@ -521,6 +549,10 @@ impl Provider for AntigravityProvider {
     /// 与模型目录里的每模型 `quota` 键不是一回事：那是**目录侧**的单模型读数
     /// （随 `fetchAvailableModels` 进缓存），这里是**账号级**的窗口额度 ——
     /// 两者并存，互不替代。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        crate::quota::sources(&self.meta().id, report)
+    }
+
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             balance::query_usage(ctx, account)
@@ -545,6 +577,21 @@ impl Provider for AntigravityProvider {
 
     fn account_identity(&self, secret: &Value) -> Result<String, String> {
         Ok(accounts::identity_of(secret))
+    }
+
+    fn admin_action<'a>(
+        &'a self,
+        _ctx: &'a PluginCtx,
+        _account: &'a str,
+        action: &'a str,
+        _payload: &'a Value,
+    ) -> SendFuture<'a, Value> {
+        Box::pin(async move {
+            match action {
+                "auth.methods" => Ok(super::login_methods::methods()),
+                _ => Err(agent2api_provider_sdk::unsupported("Antigravity 未提供此管理操作")),
+            }
+        })
     }
 
     // ── 登录 ──────────────────────────────────────────────────

@@ -191,29 +191,26 @@ pub fn note_challenge() {
     }
 }
 
-/// 记一次「上游确实回了 3007」，并把「推理免码」的结论**翻回要码**。
-///
-/// 为什么 3007 必须能翻这个结论：它是这条链上**唯一**能证伪 `skip_model_request`
-/// 的观测。免码上线后如果上游哪天把这一格改回 `false`（或直接不认这个开关），
-/// 我们手上不会有任何配置侧的信号 —— 只有 3007 会说话。让它当场改回要码，
-/// 免码路线的代价就被钉在「**最多一次** 3007 往返」上，而不是每次都撞。
+/// 记一次上游 3007；实际验证失败优先于推理免码配置。
 pub fn note_challenge_and_require_token() {
     note_challenge();
+    CHALLENGE_REQUIRES_TOKEN.store(true, Ordering::SeqCst);
     set_required(true);
 }
 
-// ── 「此刻到底要不要一枚令牌」这个结论长在哪 ───────────────────
-//
-// 判据来自上游自己的配置（`configs.captcha.skip_model_request`，见
-// [`super::claim::CaptchaConfig`]），由 [`super::config_sync`] 每 5 分钟同步一次；
-// 3007 会当场把它翻回「要码」（[`note_challenge_and_require_token`]）。
-//
-// 默认值 = **要码**。这不是保守主义：headless 部署上「要码」的后果只是这个模型名
-// 由别家承载（见 `core::providers::readiness` 那条顺延路），而「免码」判错的后果是
-// 每条请求都白撞一次 3007、逐次消耗账号行为分。两边代价不对称。
+/// 推理免码只取上游明确下发的开关；实际 3007 比配置优先。
+pub fn apply_config(config: &super::claim::CaptchaConfig) {
+    note_synced();
+    if !config.enabled {
+        CHALLENGE_REQUIRES_TOKEN.store(false, Ordering::SeqCst);
+    }
+    set_required(config.enabled && (!config.skip_model_request
+        || CHALLENGE_REQUIRES_TOKEN.load(Ordering::SeqCst)));
+}
 
 /// 结论本体（`true` = 每条模型请求都要一枚令牌）
 static TOKEN_REQUIRED: AtomicBool = AtomicBool::new(true);
+static CHALLENGE_REQUIRES_TOKEN: AtomicBool = AtomicBool::new(false);
 /// 上一次同步到配置的时刻（0 = 启动至今没同步成功过；面板与排障读它）
 static LAST_SYNC_AT: AtomicI64 = AtomicI64::new(0);
 
@@ -262,8 +259,7 @@ pub fn set_required(required: bool) -> bool {
     } else {
         logging::console_line(
             "[ZCode]",
-            "🔓 上游配置说模型请求不必再附验证码令牌（skip_model_request）：\
-             套餐池（Start Plan）通道改为免码直发，桌面端停止铸造令牌",
+            "🔓 上游配置允许推理免验证码：套餐池（Start Plan）通道停止取用与铸造令牌",
         );
         ungate();
     }

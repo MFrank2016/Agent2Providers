@@ -277,7 +277,19 @@ pub(super) fn signed_auth_headers(token: &str) -> Vec<(String, String)> {
         ),
     ];
     if !token.is_empty() {
-        headers.push(("authorization".to_string(), format!("Bearer {token}")));
+        // ── 必须剥一次前缀再拼（issue #386）────────────────────────
+        // 登录拿到的 `access_token` 本身可能已经带 `Bearer `，直接拼会得到
+        // `Bearer Bearer eyJ…`，上游按空格切分后拿到字面量 `Bearer …`
+        // （不是合法 JWT）→ 恒定 401 `Invalid token`。
+        //
+        // 剥在这里而不是各个调用方：本函数是**全仓唯一**一份鉴权头实现
+        // （刷新 / 余额 / 签到 / 目录都走它），在出口统一收口才不会漏掉
+        // 某条链路。`strip_bearer` 对不带前缀的裸 token 是恒等变换，
+        // 因此对本来正常的账号零影响。
+        let token = crate::crypto::strip_bearer(token);
+        if !token.is_empty() {
+            headers.push(("authorization".to_string(), format!("Bearer {token}")));
+        }
     }
     headers
 }
@@ -285,8 +297,7 @@ pub(super) fn signed_auth_headers(token: &str) -> Vec<(String, String)> {
 /// 调一次刷新接口（源实现 `callRefreshApi`）：`POST {userapi}{path}`，
 /// body `{refresh_token, source_id: "autoclaw", device_id?}`。
 ///
-/// 鉴权接口**不走账号级代理**：账号代理是给转发（流式长请求）准备的出口，
-/// 鉴权域与 LLM 域是两个站点（与 raccoon 刷新同一取舍）。
+/// 鉴权与转发共用当前账号操作的出口。
 ///
 /// userapi 域由**凭证自己的地区**决定（`credentials.region`）—— 两地的刷新
 /// 接口路径逐字相同，只有域名不同，因此这里不需要第二份路径表。

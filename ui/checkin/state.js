@@ -158,6 +158,8 @@ export function normalizeTravel(raw) {
   const data = raw || {};
   return {
     enabled: bool(data.enabled),
+    available: data.available !== false,
+    pausedReason: text(data.pausedReason) || null,
     times: Array.isArray(data.times) ? data.times.map(text).filter(Boolean) : [],
     firedToday: Array.isArray(data.firedToday) ? data.firedToday.map(text) : [],
     lastFiredDate: text(data.lastFiredDate) || null,
@@ -581,9 +583,9 @@ export async function runGrowth(id, mode) {
   const current = growthOf(id);
   if (current.running) return;
   const targets = current.tasks.filter(task => {
-    if (!task.supported || task.unforgeable || task.locked) return false;
-    if (mode === 'claim') return task.status === 'completed' || (task.current >= task.target && task.status !== 'claimed');
-    return task.status !== 'claimed';
+    if (!task.supported || task.locked || task.status === 'claimed') return false;
+    const completed = task.status === 'completed' || (task.target > 0 && task.current >= task.target);
+    return mode === 'claim' ? completed : !task.unforgeable || completed;
   });
   if (!targets.length) {
     toast('没有需要执行的任务');
@@ -763,8 +765,17 @@ export async function runTravelNowOnce() {
   if (store.travelRunning) return;
   patch({ travelRunning: true });
   try {
-    await runTravelNow();
-    toast('✅ 已执行一轮');
+    const result = await runTravelNow();
+    if (result?.outcome === 'skipped') {
+      toast(`本轮已跳过：${result.message || ''}`);
+    } else {
+      const summary = result?.summary || {};
+      const failed = Number(summary.failed) || 0;
+      toast(
+        `猫猫旅行：${summary.actions?.length || 0} 个动作，+${Number(summary.credit) || 0} 积分，${failed} 个失败`,
+        failed > 0 ? 'err' : 'ok',
+      );
+    }
   } catch (error) {
     toast(`执行失败：${errorMessage(error)}`, 'err');
   } finally {

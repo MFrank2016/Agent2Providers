@@ -146,6 +146,10 @@ function collectUi(manifest) {
     seen.add(dir)
     files.push(...collectDir('ui', `ui/${dir}`))
   }
+  const documentation = join(PLUGIN_DIR, 'ui', 'provider-docs.json')
+  if (existsSync(documentation) && statSync(documentation).isFile()) {
+    files.push({ name: 'ui/provider-docs.json', data: readFileSync(documentation), executable: false })
+  }
   return files
 }
 
@@ -232,7 +236,7 @@ function writeZip(entries) {
 
     const central = Buffer.alloc(46)
     central.writeUInt32LE(0x02014b50, 0)
-    central.writeUInt16LE(20, 4) // 创建版本
+    central.writeUInt16LE((3 << 8) | 20, 4) // Unix 属性，ZIP 2.0
     central.writeUInt16LE(20, 6) // 解压所需版本
     central.writeUInt16LE(0x0800, 8)
     central.writeUInt16LE(0, 10)
@@ -295,10 +299,15 @@ function main() {
   // 目标 != 宿主 → 传 --target，产物在 target/<triple>/release/。
   // 路径必须按这个规则取：交叉编译时 target/release/ 里是宿主架构的旧产物，
   // 拿错会把宿主的二进制打进别的平台的包里（能装、能验签、跑起来 exec format error）。
+  // 独占最终构建可使用新的 CARGO_TARGET_DIR；打包必须取同一目录的真实产物，
+  // 不能退回插件默认 target/ 读取旧二进制。相对目录与 cargo cwd 保持一致。
+  const targetDir = process.env.CARGO_TARGET_DIR
+    ? resolve(PLUGIN_DIR, process.env.CARGO_TARGET_DIR)
+    : join(PLUGIN_DIR, 'target')
   const native = target === host
   const exe = native
-    ? join(PLUGIN_DIR, 'target', 'release', binaryName(target))
-    : join(PLUGIN_DIR, 'target', target, 'release', binaryName(target))
+    ? join(targetDir, 'release', binaryName(target))
+    : join(targetDir, target, 'release', binaryName(target))
 
   if (options.build) {
     const args = ['build', '--release', '-p', 'agent2api-providers']
@@ -323,6 +332,9 @@ function main() {
     { name: 'pack.json', data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'), executable: false },
     ...icons,
     ...ui,
+    ...collectDir('licenses', 'licenses'),
+    ...(existsSync(join(PLUGIN_DIR, 'host.json'))
+      ? [{ name: 'host.json', data: readFileSync(join(PLUGIN_DIR, 'host.json')), executable: false }] : []),
     { name: declared, data: binary, executable: true },
   ])
   writeFileSync(zipPath, zip)

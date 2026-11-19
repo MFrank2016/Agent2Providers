@@ -15,7 +15,7 @@
 //! ── 建任务请求体（逐字对照 `task-runner.ts::createTask`）──────────
 //! ```jsonc
 //! { "content": <prompt>, "host_id": "public_host", "image_id": <账号字段>,
-//!   "model_id": <目录 upstreamId>, "cli_name": "opencode|codex|claude",
+//!   "model_id": <目录 upstreamId>, "cli_name": "opencode",
 //!   "resource": {"core": 1, "memory": 1073741824, "life": 3600},
 //!   "repo": {"repo_url": "", "branch": "master", "repo_filename": "", "zip_url": ""} }
 //! ```
@@ -23,12 +23,10 @@
 //! `resource.life = 3600` 与任务流 1 小时总超时同一口径（参考注释原文：
 //! "matches resource.life"）。
 //!
-//! ── 起始 user-input 的格式（本家一个容易踩的点）─────────────────
-//! 参考的 TS 实现发**纯文本**；`docs/protocol/llm-protocol-complete.md` §5.1
-//! 把「`{"content": base64, "attachments": []}` 的 JSON 串」列为**推荐**的新
-//! 上行格式、纯文本为「仍兼容」。后端 `parseUserInputData()` 按「存储格式 →
-//! 新格式 → 纯文本」三级解析。这里发推荐的新格式；若上游版本只认纯文本，
-//! 改 `user_input_payload` 一处即可。
+//! ── 首轮任务的启动 ───────────────────────────────────────────
+//! 创建请求的 content 会在环境就绪后由上游自动执行。官方任务页先轮询到
+//! processing，再连接 mode=attach 回放首轮日志并接收实时结果。mode=new 与
+//! user-input 是追加新一轮的协议，不能在首轮环境尚未就绪时重复发送。
 //!
 //! ── 建任务失败怎么变 GatewayError ───────────────────────────────
 //!   - 传输层（连不上 / 超时）→ 502 / 504；
@@ -47,10 +45,10 @@
 
 use std::time::Duration;
 
-use base64::Engine;
 use serde_json::{json, Map, Value};
 
 use crate::http as egress;
+use crate::http::AccountRequest;
 
 use agent2api_provider_protocol::WireProxy as ResolvedProxy;
 
@@ -148,7 +146,7 @@ pub fn build_body(
     );
     body.insert("image_id".to_string(), Value::String(image_id.to_string()));
     body.insert("model_id".to_string(), Value::String(target.model_id.clone()));
-    body.insert("cli_name".to_string(), Value::String(target.cli_name.clone()));
+    body.insert("cli_name".to_string(), Value::String(endpoints::TASK_CLI_NAME.to_string()));
     body.insert(
         "resource".to_string(),
         json!({ "core": 1, "memory": 1073741824, "life": 3600 }),
@@ -173,13 +171,6 @@ pub fn build_body(
     Value::Object(body)
 }
 
-/// 起始 `user-input` 的内容：新上行格式 `{"content": "<base64>", "attachments": []}`
-/// 的 **JSON 串**（`data` 字段的值；见模块头）。
-pub fn user_input_payload(prompt: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
-    json!({ "content": encoded, "attachments": [] }).to_string()
-}
-
 /// 创建任务，返回上游 task id（UUID）。
 pub async fn create_task(
     region: Region,
@@ -196,7 +187,7 @@ pub async fn create_task(
     // 面板。插件的出站抓包由**网关侧**统一记（`HostEnv.debug_traffic` 是开关，
     // 但抓包缓冲区属于网关的 `RequestTelemetry`，插件进程里没有它）。任务流
     // （WS）本身不是 HTTP 往返，本来就没有可采集的请求 / 响应体。
-    let client = egress::client(proxy, "direct");
+    let client = egress::control_client(proxy, "direct");
     let mut builder = client.post(&url).header("Accept", "application/json");
     for (name, value) in &headers {
         builder = builder.header(name.as_str(), value);
@@ -204,6 +195,7 @@ pub async fn create_task(
     let response = builder
         .json(&body)
         .timeout(Duration::from_millis(CREATE_TIMEOUT_MS))
+        .with_account_user_agent()
         .send()
         .await
         .map_err(|error| transport_error("MonkeyCode 建任务请求", error))?;
@@ -228,7 +220,7 @@ pub async fn create_task(
         &format!(
             "建任务成功 model={} cli={} task={} promptLen={} systemPrompt={} region={}",
             target.model,
-            target.cli_name,
+            endpoints::TASK_CLI_NAME,
             task_id,
             prompt.content.chars().count(),
             if prompt.system_prompt.is_some() { "有" } else { "无" },

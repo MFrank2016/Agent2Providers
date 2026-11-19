@@ -29,66 +29,92 @@ use serde_json::Value;
 /// 控制面请求的超时（目录 / 余额 / 签到这类小请求）。
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 流式请求的**建连**超时（连不上就不必等满整个读空闲窗口）。
-pub const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// 计费接口在缺少 User-Agent 时会返回 403 / code=10085；请求级头可覆盖此默认值。
+const DEFAULT_USER_AGENT: &str = "undici";
 
-/// 流式请求的**读空闲**超时（两次收到字节之间的最大间隔）。
-///
-/// 它约束的是「上游卡住不说话」，不是「整条回答的总时长」—— 后者由上游
-/// 自己的生成长度决定，插件侧不该设上限。
-pub const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+pub trait AccountRequest: Sized {
+    fn with_account_user_agent(self) -> Self;
+}
 
-/// 控制面客户端缓存（键 = 代理 URL，空串 = 直连）。
-fn cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+impl AccountRequest for reqwest::RequestBuilder {
+    fn with_account_user_agent(self) -> Self {
+        let value = agent2api_provider_sdk::egress::user_agent();
+        if value.is_empty() { return self; }
+        match reqwest::header::HeaderValue::from_str(&value) {
+            Ok(value) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(reqwest::header::USER_AGENT, value);
+                self.headers(headers)
+            }
+            Err(_) => self.header(reqwest::header::USER_AGENT, value),
+        }
+    }
+}
+
+type ClientKey = (String, Option<crate::timeouts::Timeouts>);
+
+fn cache() -> &'static Mutex<HashMap<ClientKey, reqwest::Client>> {
+    static CACHE: OnceLock<Mutex<HashMap<ClientKey, reqwest::Client>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 流式客户端缓存（与 [`cache`] **分开**：同一代理下要两种超时口径）。
-fn stream_cache() -> &'static Mutex<HashMap<String, reqwest::Client>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// 取控制面客户端，带 20 秒总超时，不能用于读取对话流。
+///
+/// 账号操作内继承已绑定的出口；没有账号上下文时沿用 `gateway_proxy`。
+/// 配置错误由账号操作入口拦截，不允许降级到默认出口。
+pub fn control_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
+    cached_client(proxy, gateway_proxy, None)
 }
 
-/// 取一个客户端：账号级代理优先，其次网关默认出口，都没有就直连。
-///
-/// `gateway_proxy` 传 `ctx.env.proxy`（`""` = 直连，`"direct"` = 显式直连，
-/// 其余是代理 URL）。
-///
-/// ── 代理配错时的处置 ────────────────────────────────────────
-/// `reqwest::Proxy::all` 在 URL 非法时返回错误。这里**降级成直连**并返回
-/// 客户端 —— 与网关侧 `ProxyResolution` 的第三态同一条口径：可用性优先，
-/// 「代理配错了」不该让整条链路不可用。
-pub fn client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
-    let key = match proxy {
-        Some(proxy) => proxy.to_url(),
-        None => gateway_proxy.trim().to_string(),
-    };
+/// 长响应只限制建连与读取空闲，不设置整个响应体的总时限。
+pub fn stream_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
+    cached_client(proxy, gateway_proxy, Some(crate::timeouts::current()))
+}
+
+/// 当前账号操作绑定的出口优先，没有账号上下文时才使用调用方的出口与默认值。
+pub fn proxy_url(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> String {
+    agent2api_provider_sdk::egress::current().map(|route| route.url())
+        .or_else(|| proxy.map(agent2api_provider_sdk::egress::proxy_url))
+        .unwrap_or_else(|| gateway_proxy.trim().to_string())
+}
+
+fn cached_client(
+    proxy: Option<&proto::WireProxy>,
+    gateway_proxy: &str,
+    timeouts: Option<crate::timeouts::Timeouts>,
+) -> reqwest::Client {
+    let proxy_url = proxy_url(proxy, gateway_proxy);
+    let key = (proxy_url, timeouts);
     if let Ok(guard) = cache().lock() {
         if let Some(client) = guard.get(&key) {
             return client.clone();
         }
     }
-    let built = build(&key);
+    let built = build(&key.0, timeouts);
     if let Ok(mut guard) = cache().lock() {
+        if guard.len() >= 128 { guard.clear(); }
         guard.insert(key, built.clone());
     }
     built
 }
 
 /// 建一个客户端（代理 URL 为空 / `direct` = 直连）。
-fn build(proxy_url: &str) -> reqwest::Client {
+fn build(proxy_url: &str, timeouts: Option<crate::timeouts::Timeouts>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         // 与网关同一条栈：rustls，不依赖系统 openssl
         .use_rustls_tls()
-        // 控制面的默认超时；**流式请求不要用这个客户端**（总超时会掐断
-        // 长回答），改用 [`stream_client`]。
-        .timeout(CONTROL_TIMEOUT);
+        .user_agent(DEFAULT_USER_AGENT);
+    builder = match timeouts {
+        Some(timeouts) => builder
+            .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
+            .read_timeout(Duration::from_millis(timeouts.read_timeout_backstop_ms())),
+        None => builder.timeout(CONTROL_TIMEOUT),
+    };
     let trimmed = proxy_url.trim();
     if trimmed.is_empty() || trimmed == "direct" {
         // ── `no_proxy()` 为什么必须显式调 ──────────────────────────
         // `reqwest` 开了 `system-proxy` 特性（Antigravity 要跟随系统代理，
-        // 见 [`client_system_proxy`]）之后，**默认**就会读系统设置。而仓内
+        // 见 [`control_client_system_proxy`]）之后，**默认**就会读系统设置。而仓内
         // 其余二十家的口径是「直连就是直连」（出口由账号代理决定，不被机器
         // 环境悄悄改写）—— 少了这一句，那些家的直连请求会突然走用户系统里
         // 配的代理，症状是「设了账号代理反而更慢 / 没设代理却报代理错误」。
@@ -96,64 +122,22 @@ fn build(proxy_url: &str) -> reqwest::Client {
     } else {
         match reqwest::Proxy::all(trimmed) {
             Ok(proxy) => builder = builder.proxy(proxy),
-            Err(_) => {
-                // 见 `client()` 的说明：降级直连，不阻断链路
-                builder = builder.no_proxy();
-            }
+            Err(_) => return unavailable_client(),
         }
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    builder.build().unwrap_or_else(|_| unavailable_client())
 }
 
-/// 取一个**流式**客户端：代理口径与 [`client`] 完全一致，但**不设总超时**。
-///
-/// ── 为什么流式不能用 [`client`] ──────────────────────────────
-/// [`client`] 带着 [`CONTROL_TIMEOUT`]（20 秒）的 `.timeout()`。reqwest 的
-/// client 超时覆盖**整个响应体读取**，不是「等响应头」—— 对流式对话来说，
-/// 那就是「回答到第 20 秒被硬掐断」，症状是长答复必然截断、短答复正常，
-/// 极容易被误判成上游问题。
-///
-/// 这里换成两条**只约束单次操作**的超时：
-///   - [`STREAM_CONNECT_TIMEOUT`]：建连（含 TLS）等多久；
-///   - [`STREAM_READ_TIMEOUT`]：两次读到字节之间的最大空闲。
-///
-/// 于是「上游一直不说」会超时（不会挂死），而「上游说得慢 / 说很久」不会
-/// 被掐断。调用方**不要**再在单条请求上加 `.timeout()`。
-pub fn stream_client(proxy: Option<&proto::WireProxy>, gateway_proxy: &str) -> reqwest::Client {
-    let key = match proxy {
-        Some(proxy) => proxy.to_url(),
-        None => gateway_proxy.trim().to_string(),
-    };
-    if let Ok(guard) = stream_cache().lock() {
-        if let Some(client) = guard.get(&key) {
-            return client.clone();
-        }
-    }
-    let built = build_stream(&key);
-    if let Ok(mut guard) = stream_cache().lock() {
-        guard.insert(key, built.clone());
-    }
-    built
-}
-
-/// 建一个流式客户端（代理 URL 为空 / `direct` = 直连）。
-fn build_stream(proxy_url: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
+fn unavailable_client() -> reqwest::Client {
+    // 保留旧的 Client 返回形态；构造失败时拦住发送，不能偷偷改走直连或系统代理。
+    let blocked = reqwest::Proxy::custom(|_: &url::Url| Some("http://127.0.0.1:0"));
+    reqwest::Client::builder()
         .use_rustls_tls()
-        .connect_timeout(STREAM_CONNECT_TIMEOUT)
-        .read_timeout(STREAM_READ_TIMEOUT);
-    let trimmed = proxy_url.trim();
-    if trimmed.is_empty() || trimmed == "direct" {
-        // 与 [`build`] 同一条口径：直连就是直连（见那里的 `no_proxy()` 说明）。
-        builder = builder.no_proxy();
-    } else {
-        match reqwest::Proxy::all(trimmed) {
-            Ok(proxy) => builder = builder.proxy(proxy),
-            // 代理配错降级直连（与 [`client`] 一致）
-            Err(_) => builder = builder.no_proxy(),
-        }
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        .no_proxy()
+        .proxy(blocked)
+        .timeout(CONTROL_TIMEOUT)
+        .build()
+        .unwrap_or_default()
 }
 
 /// 跟随**系统代理**的客户端（进程级一份）。
@@ -167,10 +151,13 @@ fn build_stream(proxy_url: &str) -> reqwest::Client {
 /// **别把这条抄到别家** —— 对国内可直连的上游，「直连就是直连」才是正确
 /// 口径（见 [`build`] 里 `no_proxy()` 的说明）。
 ///
-/// 与 [`client`] 不同**不进缓存表**：它没有「出口参数」这一维，进程内一份
+/// 与 [`control_client`] 不同**不进缓存表**：它没有「出口参数」这一维，进程内一份
 /// 即可。系统代理改了要重启插件才生效（reqwest 在 build 时探测一次）——
 /// 登录与 Antigravity 的请求都是低频操作，这个取舍不影响正确性。
-pub fn client_system_proxy() -> reqwest::Client {
+pub fn control_client_system_proxy() -> reqwest::Client {
+    if let Some(route) = agent2api_provider_sdk::egress::current() {
+        return control_client(None, &route.url());
+    }
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -179,6 +166,7 @@ pub fn client_system_proxy() -> reqwest::Client {
             reqwest::Client::builder()
                 .use_rustls_tls()
                 .timeout(CONTROL_TIMEOUT)
+                .user_agent(DEFAULT_USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         })
@@ -190,80 +178,37 @@ pub fn client_system_proxy() -> reqwest::Client {
 /// 返回 `(status, payload)`：**非 2xx 也返回**（不在这里判成败）——
 /// 各家对「哪些状态码算失败」的判据不同（魔搭用 200 + 业务位表达失败，
 /// Command Code 用 401/403），把判定权留给调用方。
-///
-/// 调用方 `headers` 里已经带了 `Accept` 时不再补默认值：reqwest 的
-/// `header()` 是**追加**语义，重复的 `Content-Type` 被 RFC 9110 禁止，
-/// 严格的端点会直接 400。
 pub async fn get_json(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
 ) -> Result<(u16, Value), String> {
-    let mut request = client.get(url);
-    if !has_header(headers, "Accept") {
-        request = request.header("Accept", "application/json");
-    }
+    let mut request = client.get(url).header("Accept", "application/json");
     for (key, value) in headers {
         request = request.header(key, value);
     }
-    let response = request.send().await.map_err(|error| describe(&error))?;
+    let response = request.with_account_user_agent().send().await.map_err(|error| describe(&error))?;
     let status = response.status().as_u16();
     let text = response.text().await.map_err(|error| describe(&error))?;
     Ok((status, parse_json(&text)))
 }
 
 /// 发一次 POST（JSON 体）并解析 JSON 响应。
-///
-/// 默认头与 [`get_json`] 同一条口径：调用方已经给了 `Accept` / `Content-Type`
-/// 就**不重复追加**（见那里的说明）。
 pub async fn post_json(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
     body: &Value,
 ) -> Result<(u16, Value), String> {
-    let mut request = client.post(url);
-    if !has_header(headers, "Accept") {
-        request = request.header("Accept", "application/json");
-    }
-    if !has_header(headers, "Content-Type") {
-        request = request.header("Content-Type", "application/json");
-    }
-    let mut request = request.body(body.to_string());
+    let mut request = client
+        .post(url)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .body(body.to_string());
     for (key, value) in headers {
         request = request.header(key, value);
     }
-    let response = request.send().await.map_err(|error| describe(&error))?;
-    let status = response.status().as_u16();
-    let text = response.text().await.map_err(|error| describe(&error))?;
-    Ok((status, parse_json(&text)))
-}
-
-/// 调用方头里是否已经有这个键（HTTP 头名大小写不敏感）。
-fn has_header(headers: &[(String, String)], name: &str) -> bool {
-    headers
-        .iter()
-        .any(|(key, _)| key.eq_ignore_ascii_case(name))
-}
-
-/// 发一次 `application/x-www-form-urlencoded` POST 并解析 JSON 响应。
-///
-/// ── 为什么单独一个函数 ──────────────────────────────────────
-/// [`post_json`] 把 body 序列化成 JSON，而 OAuth 的 `/token` 这类端点
-/// 只认表单编码；[`send_raw`] 的 body 参数是 `Option<&Value>`，同样发不了
-/// 表单。返回口径与另两个一致：**非 2xx 也给 `Ok`**，判定权在调用方。
-pub async fn post_form(
-    client: &reqwest::Client,
-    url: &str,
-    form: &[(&str, &str)],
-) -> Result<(u16, Value), String> {
-    let response = client
-        .post(url)
-        .header("Accept", "application/json")
-        .form(form)
-        .send()
-        .await
-        .map_err(|error| describe(&error))?;
+    let response = request.with_account_user_agent().send().await.map_err(|error| describe(&error))?;
     let status = response.status().as_u16();
     let text = response.text().await.map_err(|error| describe(&error))?;
     Ok((status, parse_json(&text)))
@@ -278,9 +223,6 @@ pub async fn post_form(
 ///
 /// 非 2xx 也返回结果（与 [`get_json`] 同口径：判定权在调用方）；但错误体
 /// 会被读出来放进 [`SseResponse::error_body`]，免得调用方忘了读。
-///
-/// `client` 应当是 [`stream_client`] 给的：带 [`CONTROL_TIMEOUT`] 的控制面
-/// 客户端会把长回答在第 20 秒掐断。
 pub async fn post_stream(
     client: &reqwest::Client,
     url: &str,
@@ -296,21 +238,13 @@ pub async fn post_stream(
     for (key, value) in headers {
         request = request.header(key, value);
     }
-    let response = request.send().await.map_err(|error| describe(&error))?;
+    let response = request.with_account_user_agent().send().await.map_err(|error| describe(&error))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         let text = response.text().await.unwrap_or_default();
-        return Ok(SseResponse {
-            status,
-            response: None,
-            error_body: Some(text),
-        });
+        return Ok(SseResponse { status, response: None, error_body: Some(text) });
     }
-    Ok(SseResponse {
-        status,
-        response: Some(response),
-        error_body: None,
-    })
+    Ok(SseResponse { status, response: Some(response), error_body: None })
 }
 
 /// [`post_stream`] 的结果。
@@ -331,12 +265,7 @@ impl SseResponse {
 
     /// 错误体的前 240 个字符（拼错误文案用）。
     pub fn error_head(&self) -> String {
-        self.error_body
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .take(240)
-            .collect()
+        self.error_body.as_deref().unwrap_or("").chars().take(240).collect()
     }
 }
 
@@ -364,9 +293,7 @@ pub struct ApiResponse {
 /// 30 秒、目录 20 秒、账单 25 秒各不相同），也要在传输失败时拿到
 /// `reqwest::Error` 好判 `is_timeout()`。所以这里原样复刻那个签名。
 ///
-/// `proxy` 为 `None` 时**直连**（与网关 `send_raw` 的语义逐字一致：那个函数
-/// 收 `Option<&ResolvedProxy>`，`None` 走 `client_for(None)` = 直连，**不是**
-/// 跟随网关默认出口）。搬来的「鉴权接口不走账号代理」那几处正是这个语义。
+/// `proxy` 为 `None` 时继承当前账号操作的出口；没有账号上下文时才直连。
 pub async fn send_raw(
     method: &str,
     url: &str,
@@ -376,9 +303,9 @@ pub async fn send_raw(
     timeout_ms: Option<u64>,
 ) -> Result<ApiResponse, reqwest::Error> {
     let client = match proxy {
-        Some(proxy) => client(Some(proxy), ""),
-        // `"direct"` 是 http::client 的显式直连哨兵（见它的说明）
-        None => client(None, "direct"),
+        Some(proxy) => control_client(Some(proxy), ""),
+        // `direct` 是显式直连，不跟随系统代理。
+        None => control_client(None, "direct"),
     };
     let mut builder = match method {
         "POST" => client.post(url),
@@ -399,7 +326,7 @@ pub async fn send_raw(
     if let Some(timeout) = timeout_ms {
         builder = builder.timeout(Duration::from_millis(timeout));
     }
-    let response = builder.send().await?;
+    let response = builder.with_account_user_agent().send().await?;
     let status = response.status().as_u16();
     let ok = response.status().is_success();
     let text = response.text().await?;
@@ -408,11 +335,7 @@ pub async fn send_raw(
     } else {
         serde_json::from_str::<Value>(&text).ok()
     };
-    Ok(ApiResponse {
-        status,
-        ok,
-        payload,
-    })
+    Ok(ApiResponse { status, ok, payload })
 }
 
 /// 空体 / 非 JSON 一律给 `Value::Null`（与网关 `send_raw` 同口径）。
@@ -469,103 +392,4 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    /// 起一个只收一次请求的裸 HTTP 服务：返回 (url, 拿原始请求文本的句柄)。
-    async fn serve_once() -> (String, tokio::task::JoinHandle<String>) {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("绑定回环端口");
-        let addr = listener.local_addr().expect("取本地地址");
-        let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("接受连接");
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0u8; 1024];
-                let read = socket.read(&mut chunk).await.expect("读请求");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                // 只要拿到请求头就够了，不必等 body 读完
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .await
-                .expect("写响应");
-            String::from_utf8_lossy(&request).to_string()
-        });
-        (format!("http://{addr}/probe"), handle)
-    }
-
-    /// 请求头里某个名字出现几次（大小写不敏感）。
-    fn header_count(request: &str, name: &str) -> usize {
-        request
-            .lines()
-            .skip(1)
-            .take_while(|line| !line.is_empty())
-            .filter(|line| {
-                line.split(':')
-                    .next()
-                    .is_some_and(|key| key.eq_ignore_ascii_case(name))
-            })
-            .count()
-    }
-
-    #[test]
-    fn has_header_is_case_insensitive() {
-        let headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            ("ACCEPT".to_string(), "text/event-stream".to_string()),
-        ];
-        assert!(has_header(&headers, "Content-Type"));
-        assert!(has_header(&headers, "accept"));
-        assert!(!has_header(&headers, "Authorization"));
-    }
-
-    #[tokio::test]
-    async fn post_json_does_not_duplicate_caller_content_type() {
-        let (url, server) = serve_once().await;
-        // 故意用小写，验证去重是大小写不敏感的
-        let headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            ("Accept".to_string(), "application/json".to_string()),
-        ];
-        let (status, _) = post_json(
-            &client(None, "direct"),
-            &url,
-            &headers,
-            &serde_json::json!({"a": 1}),
-        )
-        .await
-        .expect("POST 应成功");
-        assert_eq!(status, 200);
-        let request = server.await.expect("服务端任务");
-        assert_eq!(header_count(&request, "content-type"), 1, "{request}");
-        assert_eq!(header_count(&request, "accept"), 1, "{request}");
-    }
-
-    #[tokio::test]
-    async fn get_json_does_not_duplicate_caller_accept() {
-        let (url, server) = serve_once().await;
-        let headers = vec![("ACCEPT".to_string(), "application/json".to_string())];
-        let (status, _) = get_json(&client(None, "direct"), &url, &headers)
-            .await
-            .expect("GET 应成功");
-        assert_eq!(status, 200);
-        let request = server.await.expect("服务端任务");
-        assert_eq!(header_count(&request, "accept"), 1, "{request}");
-    }
 }

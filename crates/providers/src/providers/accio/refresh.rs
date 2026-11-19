@@ -5,10 +5,8 @@
 //! `core::login` 里那套账号切换的安全版是 `/api/auth/safe/refresh_token`，
 //! 本网关不做账号切换，走普通那条）。
 //!
-//! ── 上游没回过期时间怎么办 ──────────────────────────────────
-//! `expiresAt` 缺失时给一个保守的默认值（1 小时）：它只影响「下次要不要续期」
-//! 的判定，给短了会多刷一次（无害），给长了会让一个已经失效的 token 留着不走
-//! 续期路径（有害）。桌面端的 token 有效期在小时级，1 小时是安全的下界。
+//! 上游可能保持令牌原值、只延长有效期；不能仅以令牌是否变化判定续期成功。
+//! 未返回有效期时使用 1 小时作为下次主动刷新时间。
 
 use std::sync::OnceLock;
 
@@ -83,6 +81,23 @@ pub async fn ensure_fresh(
     }
 }
 
+pub async fn after_rejection(
+    ctx: &PluginCtx,
+    account_id: &str,
+    region: super::endpoints::Region,
+    rejected: &Credentials,
+) -> Result<Credentials, GatewayError> {
+    let (_, current) = snapshot(ctx, account_id, region).await?;
+    // 在途请求被拒时，其他请求可能已经完成续期，不能再次消耗旧刷新凭证。
+    if current.access_token != rejected.access_token
+        || current.refresh_token != rejected.refresh_token
+        || current.expires_at > rejected.expires_at
+    {
+        return Ok(current);
+    }
+    ensure_fresh(ctx, account_id, region, true).await
+}
+
 async fn refresh_and_save(
     ctx: &PluginCtx,
     record: &Value,
@@ -105,6 +120,11 @@ async fn refresh_and_save(
     let refresh = credentials::secret(&data, &["refreshToken", "refresh_token"])?;
     if !refresh.is_empty() {
         fresh.refresh_token = refresh;
+    }
+    // 续期响应带回新的 sgcookie 就换掉；没带就沿用旧的（`clone` 已经带上）
+    let sgcookie = credentials::sgcookie(&data);
+    if !sgcookie.is_empty() {
+        fresh.sgcookie = sgcookie;
     }
     fresh.expires_at = Some(
         credentials::timestamp(
@@ -153,6 +173,7 @@ fn merge_credentials(expect: &Value, fresh: &Credentials) -> Value {
         ("email", Value::String(fresh.email.clone())),
         ("nickname", Value::String(fresh.name.clone())),
         ("deviceId", Value::String(fresh.device_id.clone())),
+        ("sgcookie", Value::String(fresh.sgcookie.clone())),
         ("mode", Value::String(fresh.region.edition().to_string())),
     ] {
         if value.is_null() || matches!(&value, Value::String(text) if text.is_empty()) {

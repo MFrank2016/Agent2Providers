@@ -42,6 +42,28 @@ use crate::http;
 
 use super::endpoints;
 
+/// 表单 POST：`meoo` 的 `/oauth/token` 是裸表单，上游 `http` 已不再提供这条。
+/// 非 2xx 也原样返回（状态码 + 解析后的 JSON），由调用方分类。
+async fn post_form(
+    client: &reqwest::Client,
+    url: &str,
+    form: &[(&str, &str)],
+) -> Result<(u16, Value), String> {
+    let response = client
+        .post(url)
+        .header("Accept", "application/json")
+        .form(form)
+        .send()
+        .await
+        .map_err(|error| http::describe(&error))?;
+    let status = response.status().as_u16();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| http::describe(&error))?;
+    Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
 /// 一轮 PKCE 的两个值：`verifier` 自己留着换票，`challenge` 进授权地址。
 pub struct Pkce {
     /// 授权码校验值（32 随机字节的 base64url 无填充，43 字符）
@@ -161,8 +183,8 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenBundle, GatewayError> {
-    let client = http::client(None, &ctx.env.proxy);
-    let (status, payload) = http::post_form(
+    let client = http::control_client(None, &ctx.env.proxy);
+    let (status, payload) = post_form(
         &client,
         &endpoints::token_url(api_base),
         &[
@@ -193,8 +215,8 @@ pub async fn refresh(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<TokenBundle, GatewayError> {
-    let client = http::client(None, &ctx.env.proxy);
-    let (status, payload) = http::post_form(
+    let client = http::control_client(None, &ctx.env.proxy);
+    let (status, payload) = post_form(
         &client,
         &endpoints::token_url(api_base),
         &[

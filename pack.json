@@ -1,7 +1,9 @@
 {
   "id": "agent2api-providers",
-  "name": "Agent2API 官方提供商",
-  "version": "0.2.2",
+  "name": "提供商增强",
+  "description": "为 Agent2API 扩展多家 AI 提供商，提供模型调用、账号登录与导入、凭证续期、模型目录、余额查询和签到等能力。具体功能以各提供商的支持情况为准。",
+  "license": "AGPL-3.0",
+  "version": "3.5.0-beta.2",
   "protocol": 1,
   "providers": [
     {
@@ -59,98 +61,98 @@
       "default_enabled": true
     },
     {
-      "id": "chatglm",
-      "label": "智谱清言",
-      "order": 9,
-      "default_enabled": true
-    },
-    {
       "id": "autoclaw",
       "label": "AutoClaw 国内版",
-      "order": 10,
+      "order": 9,
       "default_enabled": true
     },
     {
       "id": "autoclaw-intl",
       "label": "AutoClaw 国际版",
-      "order": 11,
+      "order": 10,
       "default_enabled": true
     },
     {
       "id": "officeace",
       "label": "OfficeAce 果办",
-      "order": 12,
+      "order": 11,
       "default_enabled": true
     },
     {
       "id": "zcode",
       "label": "ZCode 国内版",
-      "order": 13,
+      "order": 12,
       "default_enabled": true
     },
     {
       "id": "zcode-intl",
       "label": "ZCode 国际版",
-      "order": 14,
+      "order": 13,
       "default_enabled": true
     },
     {
       "id": "workbuddy",
       "label": "WorkBuddy 国内版",
-      "order": 15,
+      "order": 14,
       "default_enabled": true
     },
     {
       "id": "workbuddy-intl",
       "label": "WorkBuddy 国际版",
-      "order": 16,
+      "order": 15,
       "default_enabled": true
     },
     {
       "id": "cline-free",
       "label": "Cline 免费池",
-      "order": 17,
+      "order": 16,
       "default_enabled": true
     },
     {
       "id": "cline-pass",
       "label": "Cline 订阅池",
-      "order": 18,
+      "order": 17,
       "default_enabled": true
     },
     {
       "id": "kuku",
       "label": "KukuAI 库库",
-      "order": 19,
+      "order": 18,
       "default_enabled": true
     },
     {
       "id": "monkeycode",
       "label": "MonkeyCode 国内版",
-      "order": 20,
+      "order": 19,
       "default_enabled": true
     },
     {
       "id": "monkeycode-intl",
       "label": "MonkeyCode 国际版",
-      "order": 21,
+      "order": 20,
       "default_enabled": true
     },
     {
       "id": "qoder",
       "label": "Qoder 中国版",
-      "order": 22,
+      "order": 21,
       "default_enabled": true
     },
     {
       "id": "qoder-intl",
       "label": "Qoder 国际版",
+      "order": 22,
+      "default_enabled": true
+    },
+    {
+      "id": "qwenwork",
+      "label": "千问办公 国内版",
       "order": 23,
       "default_enabled": true
     },
     {
-      "id": "trae",
-      "label": "Trae",
+      "id": "qwenwork-intl",
+      "label": "千问办公 国际版",
       "order": 24,
       "default_enabled": true
     },
@@ -161,39 +163,63 @@
       "default_enabled": true
     },
     {
+      "id": "trae",
+      "label": "Trae",
+      "order": 26,
+      "default_enabled": true
+    },
+    {
       "id": "accio",
       "label": "Accio 国际版",
-      "order": 26,
+      "order": 27,
       "default_enabled": true
     },
     {
       "id": "accio-cn",
       "label": "Accio 国内版",
-      "order": 27,
+      "order": 28,
       "default_enabled": true
     },
     {
       "id": "codearts",
       "label": "CodeArts",
-      "order": 28,
+      "order": 29,
       "default_enabled": true
     },
     {
       "id": "antigravity",
       "label": "Antigravity",
-      "order": 29,
+      "order": 30,
+      "default_enabled": true
+    },
+    {
+      "id": "doubaowork",
+      "label": "豆包工作",
+      "order": 31,
       "default_enabled": true
     },
     {
       "id": "kiro",
       "label": "Kiro",
-      "order": 30,
+      "order": 32,
       "default_enabled": true
     },
     {
       "id": "meoo",
       "label": "Meoo 秒悟",
-      "order": 31,
+      "order": 33,
+      "default_enabled": true
+    },
+    {
+      "id": "astudio",
+      "label": "AStudio",
+      "order": 34,
+      "default_enabled": true
+    },
+    {
+      "id": "quwork",
+      "label": "QuWork",
+      "order": 35,
       "default_enabled": true
     }
   ],

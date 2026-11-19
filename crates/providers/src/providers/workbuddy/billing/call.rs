@@ -6,14 +6,9 @@
 //! 那几项**都**有调用方了，但默认值仍是「只查积分」那一套 —— 查积分的调用点
 //! 因此不必写一堆 `..Default::default()`。
 //!
-//! 判定顺序与文案**逐字保留**（401/403 一档、非 2xx 一档、业务码一档）——
-//! 那是用户看到的错误原文，改了就是行为漂移。
+//! 判定顺序：401 身份失效、其它非 2xx、业务码失败；403 保留上游拒绝原因。
 //!
-//! ── 头集合为什么不复用转发那套 ──────────────────────────────
-//! 计费版的 `build_headers` 与转发版的 `build_auth_headers` **不能互相替换**：
-//! 前者固定带 `Content-Type` / `Accept`、`X-User-Id` 缺省给空串、无 token 也给
-//! `Bearer `，且不带 `X-Department-Info`。这些差别是上游两个 buildHeaders 各自
-//! 的实现决定的（见 `billing::headers`）。
+//! 计费使用后台请求框架的身份头；对话专属头不应进入这条链路。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
@@ -26,9 +21,7 @@ use crate::errors::GatewayError;
 use crate::http::send_raw;
 use crate::logging;
 
-use crate::workbuddy_shared::endpoints::{
-    normalize_endpoint, DEFAULT_ENDPOINT, RESPONSE_CODE_OK,
-};
+use crate::workbuddy_shared::endpoints::RESPONSE_CODE_OK;
 use super::headers::{build_headers, whitelist_headers};
 
 /// 计费接口的请求超时（与网关 `billing::REQUEST_TIMEOUT_MS` 同档）。
@@ -96,13 +89,8 @@ pub(super) async fn call(
 ) -> Result<BillingCall, GatewayError> {
     // 账户级端点：国内版/国际版账号各走自己的站点。会话缺 endpoint 时回落到
     // 该账号所属地区的默认端点（由调用方在 session 里补好，见 `workbuddy::mod`）。
-    let endpoint = session
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(normalize_endpoint)
-        .unwrap_or_else(|| normalize_endpoint(DEFAULT_ENDPOINT));
+    let region = super::super::Region::from_edition_id(session.get("edition").and_then(Value::as_str));
+    let endpoint = super::super::session_endpoint_of(session, region);
     let base = options.base.map(str::to_string).unwrap_or(endpoint);
     let url = format!("{base}{path}{}", options.query.unwrap_or(""));
 
@@ -178,10 +166,22 @@ pub(super) async fn call(
         .and_then(|value| value.get("requestId"))
         .cloned();
 
-    if response.status == 401 || response.status == 403 {
+    if response.status == 401 {
+        // ── 为什么文案里带完整 URL（issue #381）────────────────────
+        // 401 有两种成因，处置完全相反：
+        //   ① 凭证真的失效 → 重新登录；
+        //   ② 账号的 `endpoint` 拼错 / 落到了另一个地区的站点 → 改端点，
+        //      重新登录也没用。
+        // 原来两种情况共用「登录态已过期或被拒绝」，把用户往 ① 带。而排查时
+        // 最缺的信息正是「这次到底打了哪个地址」—— 只给路径片段（日志里那条
+        // `auth/token/refresh`）看不出域名错没错。所以这里把请求的完整 URL
+        // 写进错误：一眼能看出打的是国内版还是国际版站点。
         return Err(GatewayError::with_status(
             401,
-            "登录态已过期或被拒绝，无法调用计费接口",
+            format!(
+                "登录态被上游拒绝（HTTP 401，请求地址 {url}）：若该地址与账号所在地区不符，\
+                 请检查账号的端点（endpoint）配置；地址正确时才是凭证失效，需要重新登录"
+            ),
         )
         .with_optional_code(code));
     }

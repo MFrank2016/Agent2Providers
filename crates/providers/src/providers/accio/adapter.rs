@@ -8,10 +8,8 @@
 //! ── 为什么 `stateful = true` ────────────────────────────────
 //! 见模块头（Gemini 信封 + ADK 帧）。
 //!
-//! ── 续期是真的 ──────────────────────────────────────────────
-//! 上游有 refreshToken 链（`/api/auth/refresh_token`），而且 accessToken 是
-//! **小时级**有效期 —— 不接续期就会每小时撞一次 401。`ensure_token` 走临期
-//! 门（5 分钟窗口），`refresh_token` 无条件换发（401 之后救一次）。
+//! 上游有 refreshToken 链（`/api/auth/refresh_token`）。`ensure_token` 在临期时
+//! 主动续期；对话在尚未输出内容时遇到明确的鉴权失败，强制续期后只重试一次。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：零 unwrap / expect / panic。
@@ -49,6 +47,95 @@ pub static ACCIO_CN: AccioProvider = AccioProvider { region: Region::Cn };
 #[derive(Clone, Copy)]
 pub struct AccioProvider {
     region: Region,
+}
+
+impl AccioProvider {
+    /// 转发前的**目录准备**（本地区）：内存里没有远程清单时先读账号台账，
+    /// 再退到就地补拉一次。
+    ///
+    /// ── 为什么这里不是"拿不到就拒发" ────────────────────────────
+    /// Accio 有静态兜底表，拿不到远程清单也能解析一部分模型 —— 拒发反而更糟。
+    /// 但兜底表是「照客户端内置抄的」一份旧清单，上游新加的模型不在里面：
+    /// `resolve` 找不到就报 400「模型不存在」，而界面里那个模型是列着的
+    /// （网关那份是从它自己的落盘缓存恢复的，与插件这份不通）。所以本函数做的是
+    /// **尽力补全**：补到了就用真的，补不到仍旧走既有的兜底 + 400 那条路
+    /// （行为不倒退，只是多了一次能成的机会）。
+    ///
+    /// 放在 `chat::build_plan` 之前：那一层的模型解析是同步的，读台账塞不进去。
+    async fn ensure_catalog(
+        &self,
+        ctx: &PluginCtx,
+        account: &str,
+        credentials: &Credentials,
+        proxy: Option<&ResolvedProxy>,
+    ) {
+        if !models::remote_models(self.region).is_empty() {
+            return;
+        }
+        let provider = self.region.provider_id();
+        if let Some(payload) = crate::catalog_ledger::load(ctx, account, models::LEDGER_KIND).await {
+            if models::restore_from_saved(&payload) {
+                crate::catalog_backoff::clear(provider, account);
+                logging::log(
+                    "[Models]",
+                    &format!(
+                        "Accio {}模型目录从台账恢复（转发可直接使用）",
+                        self.region.label()
+                    ),
+                );
+                if !models::remote_models(self.region).is_empty() {
+                    return;
+                }
+            }
+        }
+        // 刚刚试过、又失败了：这一轮不再打上游（见 `catalog_backoff`），
+        // 继续走静态兜底那条既有路径
+        if let Some(cooling) =
+            crate::catalog_backoff::cooling(provider, account, logging::now_ms())
+        {
+            logging::verbose(
+                "[Models]",
+                &format!(
+                    "Accio {}模型目录补拉冷却中（{} 秒后自动重试）：{}",
+                    self.region.label(),
+                    crate::catalog_backoff::seconds_left(cooling.ms_left),
+                    cooling.reason
+                ),
+            );
+            return;
+        }
+        // 台账没有（或只补上了另一个地区）：就地补拉一次本地区
+        let outcome = models::refresh(credentials, proxy, false).await;
+        if outcome.refreshed {
+            crate::catalog_backoff::clear(provider, account);
+            return;
+        }
+        let reason = outcome.message.unwrap_or_else(|| "未知原因".to_string());
+        crate::catalog_backoff::hold(provider, account, &reason, logging::now_ms());
+        logging::verbose(
+            "[Models]",
+            &format!("Accio {}模型目录就地补拉未成功：{reason}", self.region.label()),
+        );
+    }
+}
+
+/// 把两个地区的远程清单写进账号台账（刷新成功后调用）。
+///
+/// 失败只记一行 verbose：台账决定的是「下次重启能不能提前恢复」，写不进去不影响
+/// 这一次刷新，也不该把一次成功的刷新变成失败。
+async fn persist_catalog(ctx: &PluginCtx, account: &str) {
+    if account.trim().is_empty() {
+        return;
+    }
+    let payload = models::saved_payload();
+    if let Err(error) =
+        crate::catalog_ledger::save(ctx, account, models::LEDGER_KIND, &payload).await
+    {
+        logging::verbose(
+            "[Models]",
+            &format!("Accio 目录台账写入失败（不影响本次刷新）：{error}"),
+        );
+    }
 }
 
 impl Provider for AccioProvider {
@@ -151,63 +238,73 @@ impl Provider for AccioProvider {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            // 凭证（含临期主动刷新）。显式账号必填 —— Accio 没有环境变量旁路。
             let context = account_context(ctx, &account_id, self.region, false)
                 .await
-                .map_err(GatewayError::into_message)?;
-            // 思考档位：客户端显式指定 > 映射绑定（`body` 里已由网关的 payload
-            // 层注入 —— `reasoning_patch` 在网关侧调用，注入的是同一个键）
+                .map_err(GatewayError::into_control_message)?;
             let effort = protocol::client_effort(&req.body);
-            let plan = chat::build_plan(&context.credentials, &req.body, &model_name, effort.as_deref())
-                .map_err(GatewayError::into_message)?;
             let effective_proxy = req.proxy.clone().or(context.proxy);
-
-            logging::verbose(
-                "[Accio]",
-                &format!(
-                    "POST {} model={} upstream={} stream={} region={} account={}",
-                    plan.url,
-                    if model_name.is_empty() { "(默认)" } else { &model_name },
-                    plan.upstream_key,
-                    req.stream,
-                    self.region.edition(),
-                    account_id,
-                ),
-            );
-
-            // 插件里的遥测是空实现（见 `telemetry` 模块头）：调用点逐字保留。
+            let mut credentials = context.credentials;
+            self.ensure_catalog(ctx, &account_id, &credentials, effective_proxy.as_ref())
+                .await;
             let telemetry = std::sync::Arc::new(RequestTelemetry::new());
             let capture = telemetry.capture();
-            if let Some(capture) = capture.as_deref() {
-                let headers: Vec<(String, String)> = plan.headers.clone();
-                capture.reset_request(&plan.url, "accio", &headers, &req.body);
-            }
-
-            let response = chat::send(&plan, effective_proxy.as_ref())
-                .await
-                .map_err(GatewayError::into_message)?;
-            if let Some(capture) = capture.as_deref() {
-                capture.attach_response(response.status().as_u16(), response.headers());
-            }
             let limit = chat::LimitContext {
                 account_id: account_id.clone(),
                 model: model_name.clone(),
             };
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let error = chat::http_error(status, response).await;
-                if error.status_code == 429 {
-                    chat::record_limited(ctx, &limit, &error.message).await;
+            let mut refreshed = false;
+            let (plan, prefetched, source) = loop {
+                let plan = chat::build_plan(&credentials, &req.body, &model_name, effort.as_deref())
+                    .map_err(GatewayError::into_control_message)?;
+                logging::verbose(
+                    "[Accio]",
+                    &format!(
+                        "POST {} model={} upstream={} stream={} region={} account={}",
+                        plan.url,
+                        if model_name.is_empty() { "(默认)" } else { &model_name },
+                        plan.upstream_key,
+                        req.stream,
+                        self.region.edition(),
+                        account_id,
+                    ),
+                );
+                if let Some(capture) = capture.as_deref() {
+                    capture.reset_request(&plan.url, "accio", &plan.headers, &req.body);
                 }
-                return Err(error.message);
-            }
-
+                let response = chat::send(&plan, effective_proxy.as_ref())
+                    .await
+                    .map_err(GatewayError::into_control_message)?;
+                if let Some(capture) = capture.as_deref() {
+                    capture.attach_response(response.status().as_u16(), response.headers());
+                }
+                let opening = if response.status().is_success() {
+                    chat::prefetch_stream_head(ctx, response, &limit).await
+                } else {
+                    let error = chat::http_error(response.status().as_u16(), response).await;
+                    if error.status_code == 429 {
+                        chat::record_limited(ctx, &limit, &error.message).await;
+                    }
+                    Err(error)
+                };
+                match opening {
+                    Ok((prefetched, source)) => break (plan, prefetched, source),
+                    Err(error) if error.status_code == 401 && !refreshed && credentials.can_refresh() => {
+                        // 只在首个有效输出之前补救，避免已下发内容或工具调用被重复执行。
+                        refreshed = true;
+                        credentials = refresh::after_rejection(ctx, &account_id, self.region, &credentials)
+                            .await
+                            .map_err(|mut refresh_error| {
+                                refresh_error.message = format!(
+                                    "{}；自动续期也失败：{}", error.message, refresh_error.message,
+                                );
+                                refresh_error.into_control_message()
+                            })?;
+                    }
+                    Err(error) => return Err(error.into_control_message()),
+                }
+            };
             let translator = chat::Translator::new(chat::response_id(), plan.model_name.clone());
             if req.stream {
-                // 首帧预读：额度/鉴权错误在 200 + 帧里，拦在返回之前换号无损
-                let (prefetched, source) = chat::prefetch_stream_head(ctx, response, &limit)
-                    .await
-                    .map_err(GatewayError::into_message)?;
                 sink.head(proto::StreamHead {
                     status: 200,
                     headers: [(
@@ -219,18 +316,14 @@ impl Provider for AccioProvider {
                     upstream: proto::UpstreamKind::Chat,
                 })
                 .await
-                .map_err(|error| GatewayError::with_status(499, error).message)?;
-                // 直接 await：插件的 `conversation` 本身就是 async 函数、sink 是
-                // 借用 —— 不必再绕一层通道（网关那版的 mpsc 是为了
-                // `ForwardOutcome::Stream` 那个 Stream 类型）。语义不变。
-                chat::drive_stream(ctx, source, translator, telemetry, limit, &mut sink, prefetched)
-                    .await;
-                return Ok(());
+                .map_err(|error| GatewayError::with_status(499, error).into_control_message())?;
+                return chat::drive_stream(ctx, source, translator, telemetry, limit, &mut sink, prefetched)
+                    .await
+                    .map_err(GatewayError::into_control_message);
             }
-            // 非流式：上游只支持流式，因此内部仍走流式拉取再聚合成完整响应
-            let body = chat::drive_aggregate(ctx, response, translator, telemetry, &limit)
+            let body = chat::drive_aggregate(ctx, source, translator, telemetry, &limit, prefetched)
                 .await
-                .map_err(GatewayError::into_message)?;
+                .map_err(GatewayError::into_control_message)?;
             let payload = serde_json::to_string(&body).map_err(|error| {
                 GatewayError::with_status(500, format!("Accio 聚合结果序列化失败：{error}")).message
             })?;
@@ -286,7 +379,7 @@ impl Provider for AccioProvider {
             refresh::ensure_fresh(ctx, account, self.region, false)
                 .await
                 .map(|credentials| credentials.access_token)
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 
@@ -297,7 +390,7 @@ impl Provider for AccioProvider {
             refresh::ensure_fresh(ctx, account, self.region, true)
                 .await
                 .map(|credentials| credentials.access_token)
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 
@@ -383,16 +476,30 @@ impl Provider for AccioProvider {
                 Ok(proxy) => proxy,
                 Err(error) => return Ok(proto::RefreshOutcome::failed(error.message)),
             };
-            Ok(models::refresh(&credentials, proxy.as_ref(), force).await)
+            let account_id = record
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let outcome = models::refresh(&credentials, proxy.as_ref(), force).await;
+            // 顺带落一份进账号台账：下次进程重启后不必等这一轮刷新
+            if outcome.refreshed {
+                persist_catalog(ctx, &account_id).await;
+            }
+            Ok(outcome)
         })
     }
 
     /// 查额度 / 订阅（`balance.rs`）。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        crate::quota::sources(&self.meta().id, report)
+    }
+
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             balance::query(ctx, account, self.region)
                 .await
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 
@@ -446,8 +553,7 @@ struct AccountContext {
 
 /// 取账号凭证（含临期主动刷新）与出口。
 ///
-/// `force` 语义与 `refresh::ensure_fresh` 一致；401 之后的强制刷新由编排层经
-/// `refresh_token` 调用，不在这里。
+/// `force` 与 `refresh::ensure_fresh` 同义；上游拒绝后的续期由本家对话入口补救。
 async fn account_context(
     ctx: &PluginCtx,
     account_id: &str,

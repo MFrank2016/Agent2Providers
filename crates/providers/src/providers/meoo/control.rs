@@ -64,7 +64,7 @@ async fn get_json(
     access_token: &str,
     what: &str,
 ) -> Result<Value, GatewayError> {
-    let client = http::client(None, &ctx.env.proxy);
+    let client = http::control_client(None, &ctx.env.proxy);
     let (status, payload) = http::get_json(&client, url, &headers::control_headers(access_token))
         .await
         .map_err(|error| GatewayError::with_status(502, format!("{what}失败：{error}")))?;
@@ -179,7 +179,7 @@ pub async fn resolve_service_ak(
     .await?;
     let mut ak = read(&environment);
     if ak.is_empty() && allow_cloud_enable {
-        let client = http::client(None, &ctx.env.proxy);
+        let client = http::control_client(None, &ctx.env.proxy);
         let (status, payload) = http::post_json(
             &client,
             &endpoints::cloud_url(api_base, project),

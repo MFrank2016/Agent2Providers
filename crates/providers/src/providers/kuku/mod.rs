@@ -28,7 +28,7 @@
 //! | `ProviderAdapter` + `AccountStore` | `Provider` + `PluginCtx` |
 //! | `ForwardOutcome::Stream/Completion` | `ConversationSink`（head + chunk） |
 //! | `RequestTelemetry` 抓包 | **不迁**（插件的出站抓包由网关侧记） |
-//! | `engine.rs` 的 DLL 签名参数体 | 退化成「最简表单」（见 `engine` 模块头） |
+//! | `engine.rs` 的 DLL 签名参数体 | 纯算法 MD5 签名（内置密钥，不加载 DLL） |
 //! | 账号面（`api::accounts` 的 kuku 分支） | `accounts.rs`（`normalize_account`） |
 //!
 //! ── 模型 ──────────────────────────────────────────────────
@@ -38,8 +38,9 @@
 //!
 //! ── 余额 / 签到 ────────────────────────────────────────────
 //! 余额：`GET /bizapi/gfpro/getgfvipremain` → `data.list[0].totalPoint`。
-//! 签到：「免费领积分」活动的每日任务领取（`freepoint/homenew` 面板 +
-//! `freepoint/taskComplete`，任务 `LOGIN` / `CHAT`），见 `checkin.rs`。
+//! 签到：优先「库库 30 天签到」（`act/v2/kukuai30/*`，2026-10-21 起），
+//! 旧「免费领积分」任务（`freepoint/homenew` + `freepoint/taskComplete`）
+//! 作兜底，见 `checkin.rs`。
 //! 业务会话前提（换发 genflowpro STOKEN）见 `engine.rs`。
 //!
 //! ── 刷新 / 登录形态 ────────────────────────────────────────
@@ -134,7 +135,7 @@ impl Provider for KukuProvider {
                 model_refresh: true,
                 // `/bizapi/gfpro/getgfvipremain`
                 usage: true,
-                // freepoint 每日任务（`checkin`）
+                // 30 天签到 + freepoint 每日任务（`checkin`）
                 checkin: true,
                 claims: false,
                 // 主站登录页（壳侧从 WebView Cookie 存储取回登录态）
@@ -185,7 +186,7 @@ impl Provider for KukuProvider {
                 ..Default::default()
             })
         .with_checkin(proto::CheckinInfo {
-            description: Some("「免费领积分」的每日任务 · 逐个领取".to_string()),
+            description: Some("每日签到（30 天活动）与免费领积分任务".to_string()),
             modes: vec![proto::CheckinMode::Checkin],
             ..Default::default()
         })
@@ -271,6 +272,10 @@ impl Provider for KukuProvider {
     ///
     /// 与 CatPaw 不同，KukuAI **没有独立查询凭证** —— 转发用的三个 Cookie
     /// 直接能查，因此每个账号都能查到。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        crate::quota::sources(&self.meta().id, report)
+    }
+
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             balance::query_usage(ctx, account)
@@ -279,7 +284,7 @@ impl Provider for KukuProvider {
         })
     }
 
-    /// 每日签到：freepoint 的 `LOGIN` / `CHAT` 两个任务。
+    /// 每日签到：优先 30 天签到活动，旧 freepoint 任务作兜底。
     fn checkin<'a>(
         &'a self,
         ctx: &'a PluginCtx,
@@ -342,19 +347,7 @@ impl Provider for KukuProvider {
     }
 }
 
-/// `{success, msg}` → `CheckinReport`。
-///
-/// ── 为什么要翻译（而不是直接回 Value）──────────────────────
-/// 插件协议的 `checkin.claim` 返回的是**六档 outcome**（`Claimed` / `Done` /
-/// `Ineligible` / `Inactive` / `Captcha` / `Failed`），网关据此决定「今天的
-/// 记录写成已领 / 不适用 / 需人工」。kuku 的 `{success, msg}` 只有两档，
-/// 所以：`success=true` → `Claimed`（新领到或今天已领都算成功，网关的记录
-/// 文案两者都写「已领」）；`success=false` → `Failed{message}`。
-///
-/// 「今天已经领过」在 kuku 的返回里是 `success=true` + 文案带「已领取」——
-/// 归 `Claimed` 而不是 `Done` 是有意的：网关对 `Done` 的处置与 `Claimed`
-/// 相同（都记「已领」），但 `Claimed` 的文案会带上游原话，用户能看到
-/// 「今日已领取」这种更准确的说明。
+/// 任务接口的明确结果映射为 Claimed / Done / Inactive / Failed。
 fn checkin_report(value: &Value) -> proto::CheckinReport {
     let success = value
         .get("success")
@@ -365,11 +358,19 @@ fn checkin_report(value: &Value) -> proto::CheckinReport {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let credit = value
+        .get("credit")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let streak = value
+        .get("streak")
+        .and_then(Value::as_u64)
+        .map(|days| days as u32);
     if success {
         proto::CheckinReport {
             outcome: proto::CheckinOutcome::Claimed,
-            credit: None,
-            streak: None,
+            credit: credit.clone(),
+            streak,
             message: Some(if message.is_empty() {
                 "签到成功".to_string()
             } else {
@@ -378,9 +379,15 @@ fn checkin_report(value: &Value) -> proto::CheckinReport {
         }
     } else {
         proto::CheckinReport {
-            outcome: proto::CheckinOutcome::Failed,
-            credit: None,
-            streak: None,
+            outcome: if value.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+                proto::CheckinOutcome::Done
+            } else if value.get("outcome").and_then(Value::as_str) == Some("inactive") {
+                proto::CheckinOutcome::Inactive
+            } else {
+                proto::CheckinOutcome::Failed
+            },
+            credit,
+            streak,
             message: Some(if message.is_empty() {
                 "签到失败（上游未给出原因）".to_string()
             } else {

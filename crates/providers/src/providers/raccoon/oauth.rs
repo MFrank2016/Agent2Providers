@@ -5,7 +5,7 @@
 //! `exchangeRaccoonAuthorizationCode`）。协议本身很短：
 //!
 //! ```text
-//! ① 打开 {mainOrigin}/code/authorize?login_source=desktop&appname=<客户端名>&state=<state>
+//! ① 打开 {mainOrigin}/authorize?login_source=desktop&appname=<客户端名>&state=<state>
 //! ② 用户登录成功 → 官方页面跳转 office-raccoon://auth/callback?code=…&state=…
 //! ③ POST {authApiBase}/login_with_authorization_code  body {"authorization_code": code}
 //!      → data.access_token / data.refresh_token / data.office_* （code 200035 = 授权码已失效）
@@ -47,7 +47,7 @@ use super::credentials::AUTH_REQUEST_TIMEOUT_MS;
 use super::{auth_api_base, DEFAULT_AUTH_ORIGIN};
 
 /// 授权页路径（源实现 `new URL('/code/authorize', mainOrigin)`）
-const AUTHORIZE_PATH: &str = "/code/authorize";
+const AUTHORIZE_PATH: &str = "/authorize";
 
 /// 登录来源标记：官方页面据此走「桌面端登录」分支（源实现固定 `desktop`）
 const LOGIN_SOURCE: &str = "desktop";
@@ -172,9 +172,7 @@ pub fn parse_callback_code(raw_url: &str, expected_state: &str) -> Result<String
 /// 用一次性授权码换凭证并落账号，返回账号 id
 /// （源实现 `exchangeRaccoonAuthorizationCode` + 路由里的 `store.addAccount`）。
 ///
-/// ── 出网为什么不带账号代理 ──────────────────────────────────
-/// 与 `credentials::call_refresh_api` 同一取舍：账号级代理是给转发（流式长请求）
-/// 准备的出口，而鉴权域是另一个站点；源实现同样用裸 fetch。
+/// 此时尚未建立账号，沿用登录流程的出口，不借用其他账号的代理。
 ///
 /// ── 错误语义 ────────────────────────────────────────────────
 /// 传输失败 → 502（超时 504）；授权码失效（200035）→ **400** 且文案要求重新发起；
@@ -229,13 +227,17 @@ pub async fn exchange_code(
     let refresh_token = text_of("refresh_token");
     let upstream_code = payload.get("code").and_then(Value::as_i64);
     if upstream_code == Some(CODE_EXPIRED) {
-        return Err(GatewayError::with_status(
-            400,
-            "授权码已失效，请重新发起网页登录",
-        )
-        .with_optional_code(upstream_code));
+        return Err(
+            GatewayError::with_status(400, "授权码已失效，请重新发起网页登录")
+                .with_optional_code(upstream_code),
+        );
     }
-    if !response.ok || access_token.is_empty() || refresh_token.is_empty() {
+    let iam = super::jwt::is_iam_token(&access_token);
+    if !response.ok
+        || upstream_code != Some(0)
+        || access_token.is_empty()
+        || (!iam && refresh_token.is_empty())
+    {
         let message = payload
             .get("message")
             .or_else(|| payload.get("msg"))
@@ -252,21 +254,40 @@ pub async fn exchange_code(
         } else {
             502
         };
-        return Err(GatewayError::with_status(status as i32, message).with_optional_code(upstream_code));
+        return Err(
+            GatewayError::with_status(status as i32, message).with_optional_code(upstream_code)
+        );
     }
 
     // 退回「一条可落库的账号」：id 由 userId 推导（`user-<userId>`，与内置版
     // `add_raccoon_account` 的 id 形态逐字相同 —— 同一账号重新登录会被识别成
     // 更新而不是新增）。office_* 用上游返回的下划线键名。
+    let profile = if iam {
+        Some(super::iam::user_info(&access_token).await?)
+    } else {
+        None
+    };
     let claims = super::jwt::decode_jwt_claims(&access_token);
-    let user_id = claims
+    let user_id = profile
         .as_ref()
-        .map(super::jwt::extract_user_id)
-        .filter(|value| !value.is_empty())
+        .and_then(|profile| profile.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            claims
+                .as_ref()
+                .map(super::jwt::extract_user_id)
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string());
     let mut secret = serde_json::Map::new();
-    secret.insert("accessToken".to_string(), Value::String(access_token.clone()));
-    secret.insert("refreshToken".to_string(), Value::String(refresh_token));
+    secret.insert(
+        "accessToken".to_string(),
+        Value::String(access_token.clone()),
+    );
+    if !iam {
+        secret.insert("refreshToken".to_string(), Value::String(refresh_token));
+    }
     secret.insert("userId".to_string(), Value::String(user_id.clone()));
     if let Some(expires_at) = super::jwt::jwt_expiry_ms(&access_token) {
         secret.insert("expiresAt".to_string(), Value::from(expires_at));
@@ -274,6 +295,8 @@ pub async fn exchange_code(
     for key in ["office_identity", "office_org_name", "office_org_role"] {
         let value = data
             .get(key)
+            .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+            .or_else(|| profile.as_ref().and_then(|profile| profile.get(key)))
             .map(super::jwt::js_text)
             .map(|text| text.trim().to_string())
             .unwrap_or_default();
@@ -281,10 +304,23 @@ pub async fn exchange_code(
             secret.insert(key.to_string(), Value::String(value));
         }
     }
-    let display = claims
+    if !secret.contains_key("office_identity") && iam {
+        secret.insert(
+            "office_identity".to_string(),
+            Value::String("personal".to_string()),
+        );
+    }
+    let display = profile
         .as_ref()
-        .map(super::jwt::display_name)
-        .unwrap_or_default();
+        .and_then(|profile| profile.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            claims
+                .as_ref()
+                .map(super::jwt::display_name)
+                .unwrap_or_default()
+        });
     let name = if display.trim().is_empty() {
         format!("账号 {user_id}")
     } else {

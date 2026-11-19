@@ -41,27 +41,42 @@
 //! release 是 `panic=abort`：本文件零 unwrap / expect / panic；网络不在锁内。
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use agent2api_provider_protocol as proto;
-use agent2api_provider_sdk::{ConversationSink, PluginCtx};
-use crate::http as egress;
-use agent2api_provider_protocol::WireProxy as ResolvedProxy;
-use crate::telemetry::RequestTelemetry;
-use crate::stall;
 use crate::errors::GatewayError;
+use crate::http as egress;
+use crate::http::AccountRequest;
 use crate::logging;
+use crate::stall;
+use crate::telemetry::RequestTelemetry;
+use agent2api_provider_protocol as proto;
+use agent2api_provider_protocol::WireProxy as ResolvedProxy;
+use agent2api_provider_sdk::{ConversationSink, PluginCtx};
 
+use super::catalog::Route;
 use super::credentials::Credential;
 use super::errors::ErrorKind;
-use super::headers::{IDE_VERSION, solo_headers};
-use super::payload;
+use super::headers::solo_headers;
 use super::stream::{Frame, SoloStream};
+use super::{models, payload};
 use super::{AGENT_BASE_URL, CHAT_PATH, PROVIDER_ID};
+
+const MISSING_TERMINAL: &str = "Trae 上游未给出完成事件即结束，本轮回答可能被截断";
+
+fn require_terminal() -> bool {
+    static REQUIRE: OnceLock<bool> = OnceLock::new();
+    *REQUIRE.get_or_init(|| {
+        !std::env::var("AGENT2API_TRAE_NO_REQUIRE_TERMINAL")
+            .ok()
+            .is_some_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            })
+    })
+}
 
 /// 流式的读空闲上限（与其它几家同一个配置源，不是本家自己拍的数）。
 fn stream_idle() -> Duration {
@@ -72,26 +87,32 @@ fn stream_idle() -> Duration {
 pub struct Plan {
     pub url: String,
     pub headers: Vec<(String, String)>,
-    /// 客户端要的那个模型名（回显给客户端用；上游收的裸名在 `body` 里）。
-    pub requested_model: String,
     pub body: Value,
 }
 
-/// 构造出站请求。
-///
-/// `resolved` 传空：**广告名带 `-solo` 后缀，出站名要剥回来**，这件事
-/// `prepare_body` 内部就做（它只剥一层，所以真以 `-solo` 结尾的 config 仍往返）。
-pub fn build_plan(credential: &Credential, body: &Value, base: &str) -> Result<Plan, GatewayError> {
+/// 目录里的 route 决定出站通道，客户端 model 只用于响应回显。
+pub fn build_plan(
+    credential: &Credential,
+    body: &Value,
+    base: &str,
+    route: &Route,
+    session: &str,
+) -> Result<Plan, GatewayError> {
     if credential.access_token.trim().is_empty() {
-        return Err(GatewayError::with_status(401, "Trae 账号缺少 accessToken，无法转发（请重新登录）"));
+        return Err(GatewayError::with_status(
+            401,
+            "Trae 账号缺少 accessToken，无法转发（请重新登录）",
+        ));
     }
     // 谱系闸门（**转发侧也放一份**，不只是落账号时）：账号可能是从迁移导入或
     // 手工写库进来的，那条路不经过 `add_trae_account`。Intl 凭据打到 CN host
     // 只会收到一句没头没尾的 401，与其让人猜，不如在这里说清楚。
     if super::credentials::is_intl_variant(credential.variant()) {
-        return Err(GatewayError::with_status(400, super::credentials::INTL_UNSUPPORTED));
+        return Err(GatewayError::with_status(
+            400,
+            super::credentials::INTL_UNSUPPORTED,
+        ));
     }
-    let requested = body.get("model").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let identity = super::headers::HeaderIdentity {
         access_token: credential.access_token.trim(),
         uid: credential.uid.trim(),
@@ -103,27 +124,28 @@ pub fn build_plan(credential: &Credential, body: &Value, base: &str) -> Result<P
     Ok(Plan {
         url: format!("{}{CHAT_PATH}", base.trim_end_matches('/')),
         headers,
-        requested_model: requested,
-        body: payload::prepare_body(body, credential.variant(), ""),
+        body: payload::prepare_body(body, route, session)?,
     })
 }
 
 /// 发一次请求（**不设总超时**：长推理会被总超时截断，读空闲由 `idle_guard` 兜）。
-async fn send(plan: &Plan, proxy: Option<&ResolvedProxy>) -> Result<reqwest::Response, GatewayError> {
+async fn send(
+    plan: &Plan,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<reqwest::Response, GatewayError> {
     // **不设 reqwest 总超时**：`timeout(0)` 不是"不限时"而是"立刻超时"
     // （实测报 operation timed out，症状是随机 502），而不带总超时的长流
     // 才符合本家的形状 —— 读空闲由下面的 `idle_guard` 管，整流时长不该被截。
-    let mut request = egress::client(proxy, "direct")
-        .post(&plan.url)
-        .header("User-Agent", format!("Trae/{IDE_VERSION} antigravity-cockpit-tools"));
+    let mut request = egress::stream_client(proxy, "direct").post(&plan.url);
     for (name, value) in &plan.headers {
         request = request.header(name.as_str(), value.clone());
     }
-    let response = request
-        .json(&plan.body)
-        .send()
-        .await
-        .map_err(|error| GatewayError::with_status(502, format!("Trae 请求发不出去：{}", egress::describe_chain(&error))))?;
+    let response = request.json(&plan.body).with_account_user_agent().send().await.map_err(|error| {
+        GatewayError::with_status(
+            502,
+            format!("Trae 请求发不出去：{}", egress::describe_chain(&error)),
+        )
+    })?;
     Ok(response)
 }
 
@@ -159,7 +181,13 @@ impl Limit<'_> {
                     );
                     return status;
                 }
-                logging::log("[Trae]", &format!("⚠️ 账号 {} 对模型 {} 已限额（{status}），进入冷却：{message}", self.account_id, self.model));
+                logging::log(
+                    "[Trae]",
+                    &format!(
+                        "⚠️ 账号 {} 对模型 {} 已限额（{status}），进入冷却：{message}",
+                        self.account_id, self.model
+                    ),
+                );
             }
             // 会话失效：上游明说这串凭据不行了，落同样的标记让它下一轮被跳过
             ErrorKind::SessionDead => {
@@ -174,7 +202,13 @@ impl Limit<'_> {
                     );
                     return status;
                 }
-                logging::log("[Trae]", &format!("⚠️ 账号 {} 会话失效（{status}），请重新登录", self.account_id));
+                logging::log(
+                    "[Trae]",
+                    &format!(
+                        "⚠️ 账号 {} 会话失效（{status}），请重新登录",
+                        self.account_id
+                    ),
+                );
             }
             // 过大 / 通道不可用 / 其它：**请求级**，一个字都不写账号库
             _ => {}
@@ -199,22 +233,53 @@ pub(crate) fn status_for(kind: ErrorKind) -> u16 {
     }
 }
 
-/// 非 2xx 响应 → 网关错误（错误体只读一次，读完就丢）。
-async fn http_error(status: u16, response: reqwest::Response, limit: &Limit<'_>) -> GatewayError {
+/// HTTP 或 JSON 信封里的失败暂不记账号冷却，路由耗尽后才统一落标记。
+async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
     let text = response.text().await.unwrap_or_default();
-    let head: String = text.chars().take(240).collect();
-    let kind = super::errors::classify(status, &head);
-    let message = format!("上游返回 {status}: {head}");
-    let status = limit.punish(kind, status_for(kind), &message).await;
-    GatewayError::with_status(i32::from(status), if head.is_empty() { format!("Trae 上游返回 HTTP {status}") } else { message })
+    let payload: Option<Value> = serde_json::from_str(&text).ok();
+    let (code, detail) = payload
+        .as_ref()
+        .map(super::errors::error_event_fields)
+        .unwrap_or_default();
+    let kind = match status {
+        401 => ErrorKind::SessionDead,
+        429 => ErrorKind::SoftRate,
+        403 => ErrorKind::Client,
+        _ if code != 0 => super::errors::stream_error_kind(code, &detail),
+        _ => super::errors::classify(status, &text),
+    };
+    let head: String = (if detail.is_empty() { &text } else { &detail })
+        .chars()
+        .take(240)
+        .collect();
+    let status = if status == 403 { 403 } else { status_for(kind) };
+    GatewayError::with_status(i32::from(status), format!("Trae 上游返回 {status}: {head}"))
+        .with_optional_code((code != 0).then_some(code))
 }
 
-/// 流内错误帧 → 网关错误（首包门专用：此时一个字节都还没下发）。
-async fn frame_error(code: i64, message: &str, limit: &Limit<'_>) -> GatewayError {
+fn frame_error(code: i64, message: &str) -> GatewayError {
     let kind = super::errors::stream_error_kind(code, message);
-    let text = format!("solo error code={code} msg={message}");
-    let status = limit.punish(kind, status_for(kind), &text).await;
-    GatewayError::with_status(i32::from(status), format!("Trae 上游错误：{text}")).with_code(PROVIDER_ID)
+    GatewayError::with_status(
+        i32::from(status_for(kind)),
+        format!("Trae 上游错误：code={code} msg={message}"),
+    )
+    .with_code(PROVIDER_ID)
+    .upstream_code(code)
+}
+
+async fn final_error(error: GatewayError, limit: &Limit<'_>) -> GatewayError {
+    let kind = match (error.status_code, error.upstream_code) {
+        (401, _) => ErrorKind::SessionDead,
+        (403, _) => ErrorKind::Client,
+        (429, Some(1005 | 4008)) => ErrorKind::PlanLimit,
+        (429, _) => ErrorKind::SoftRate,
+        (_, Some(code)) => super::errors::stream_error_kind(code, &error.message),
+        _ => super::errors::classify(error.status_code as u16, &error.message),
+    };
+    limit
+        .punish(kind, error.status_code as u16, &error.message)
+        .await;
+    error
 }
 
 /// 预读流头：返回「已读出的内容帧」+「剩下的流」。第一帧是错误就直接 Err。
@@ -224,16 +289,27 @@ async fn frame_error(code: i64, message: &str, limit: &Limit<'_>) -> GatewayErro
 /// 少开头几个字"）。
 pub(crate) async fn prefetch_head(
     response: reqwest::Response,
-    limit: &Limit<'_>,
-) -> Result<(Vec<Frame>, futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>, SoloStream), GatewayError> {
-    let source = response.bytes_stream().map(|item| item.map_err(|error| io::Error::other(egress::describe_chain(&error))));
+) -> Result<
+    (
+        Vec<Frame>,
+        futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>,
+        SoloStream,
+        ByteLines,
+    ),
+    GatewayError,
+> {
+    let source = response
+        .bytes_stream()
+        .map(|item| item.map_err(|error| io::Error::other(egress::describe_chain(&error))));
     let mut source = stall::idle_guard(Box::pin(source), stream_idle());
     let mut scanner = ByteLines::default();
     // `id` / `created` 从这里开始就得有值：预读到的帧要原样补发给客户端。
     let mut stream = SoloStream::new(request_id(), logging::now_ms() / 1000);
     let mut frames: Vec<Frame> = Vec::new();
     while let Some(item) = source.next().await {
-        let chunk = item.map_err(|error| GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}")))?;
+        let chunk = item.map_err(|error| {
+            GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}"))
+        })?;
         // ★ 一整段 chunk 处理完才返回 —— 中途 return 会把**同一段里后面的行**
         //   连同字节一起丢掉（那些行已经从 socket 读进来了，换手也换不回来）。
         //   上游经常把 `output`+`token_usage`+`done` 挤在同一段里，所以这不是
@@ -244,58 +320,50 @@ pub(crate) async fn prefetch_head(
                     // 门只拦"第一帧就是错误"：内容已经出去过之后再报错，
                     // HTTP 200 已经发出去了，只能留在流里如实告诉客户端。
                     if frames.is_empty() {
-                        return Err(frame_error(*code, message, limit).await);
+                        return Err(frame_error(*code, message));
                     }
                 }
                 frames.push(frame);
             }
+            if stream.completed() {
+                break;
+            }
+        }
+        if stream.completed() {
+            return Ok((frames, Box::pin(futures::stream::empty()), stream, scanner));
         }
         if !frames.is_empty() {
-            // 半行换手：缓冲区里还没成行的尾巴要拼回流头（见 `take_pending`）——
-            // 不做这一步，被切在 chunk 边界的那一帧会静默丢内容。
-            let leftover = scanner.take_pending();
-            let rest: futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>> = if leftover.is_empty() {
-                source
-            } else {
-                Box::pin(futures::stream::once(async move { Ok(bytes::Bytes::from(leftover)) }).chain(source))
-            };
-            return Ok((frames, rest, stream));
+            return Ok((frames, source, stream, scanner));
         }
     }
-    // 流在没有任何内容帧之前就结束了：交给下游按「空回答」收尾（不假装成功
-    // 也不报错 —— 真异常在 HTTP 状态那一层已经判过了）。
-    Ok((frames, source, stream))
-}
-
-/// 逐行切分（**按字节缓冲**，只在完整行上解码 UTF-8）。
-///
-/// 为什么不直接把 chunk 转成 String 再切：一个多字节字符被切在 chunk 边界时
-/// `from_utf8_lossy` 会就地吐出 U+FFFD，中文回答就会偶发变成乱码 —— 本家的
-/// 上游正文里中文占比很高，这不是理论问题。
-#[derive(Default)]
-pub struct ByteLines {
-    pending: Vec<u8>,
-}
-
-impl ByteLines {
-    /// 喂一段字节，返回其中**完整**的行（不含结尾换行）。
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        let mut lines = Vec::new();
-        self.pending.extend_from_slice(chunk);
-        while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let raw: Vec<u8> = self.pending.drain(..=index).collect();
-            let raw = raw[..raw.len() - 1].to_vec(); // 去掉 '\n'
-            let raw = if raw.last() == Some(&b'\r') { raw[..raw.len() - 1].to_vec() } else { raw };
-            lines.push(String::from_utf8_lossy(&raw).into_owned());
+    if let Some(line) = scanner.finish() {
+        for frame in stream.feed_line(&line) {
+            if let Frame::Error { code, message, .. } = &frame {
+                if frames.is_empty() {
+                    return Err(frame_error(*code, message));
+                }
+            }
+            frames.push(frame);
         }
-        lines
     }
-
-    /// 还没成行的尾巴（换手用）。
-    pub fn take_pending(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending)
+    for frame in stream.flush_pending() {
+        if let Frame::Error { code, message, .. } = &frame {
+            if frames.is_empty() {
+                return Err(frame_error(*code, message));
+            }
+        }
+        frames.push(frame);
     }
+    if frames.iter().any(|frame| matches!(frame, Frame::Chunk(_))) {
+        return Ok((frames, Box::pin(futures::stream::empty()), stream, scanner));
+    }
+    Err(GatewayError::with_status(
+        502,
+        "Trae 上游在返回内容前结束，未收到有效回答",
+    ))
 }
+
+use crate::sse_events::ByteLines;
 
 /// 把一帧写成对客户端可见的 SSE 字节。
 ///
@@ -314,13 +382,19 @@ fn render(frame: &Frame, requested: &str) -> Option<String> {
             }
             Some(format!("data: {chunk}\n\n"))
         }
-        Frame::Error { code, message, .. } => Some(format!("data: {}\n\n", json!({"error": {"message": format!("solo error code={code} msg={message}"), "type": "upstream_error"}}))),
+        Frame::Error { code, message, .. } => Some(format!(
+            "data: {}\n\n",
+            json!({"error": {"message": format!("solo error code={code} msg={message}"), "type": "upstream_error"}})
+        )),
         Frame::Done => Some("data: [DONE]\n\n".to_string()),
     }
 }
 
 fn request_id() -> String {
-    format!("chatcmpl-{}", logging::now_ms() * 1000 % 1_000_000_000_000_000)
+    format!(
+        "chatcmpl-{}",
+        logging::now_ms() * 1000 % 1_000_000_000_000_000
+    )
 }
 
 /// 用一条凭据打一次上游并产出对客户端可见的 outcome（有状态路径的入口）。
@@ -350,7 +424,6 @@ pub(crate) async fn forward_at(
     let body = &req.body;
     let stream = req.stream;
     let proxy = req.proxy.clone();
-    // 插件里的遥测是空实现（见 `telemetry` 模块头）：调用点逐字保留。
     let telemetry = Arc::new(RequestTelemetry::new());
     if account_id.is_empty() {
         return Err(GatewayError::with_status(
@@ -359,95 +432,174 @@ pub(crate) async fn forward_at(
         ));
     }
     let record = crate::store::record(ctx, PROVIDER_ID, account_id).await?;
-    if record.is_null() {
-        return Err(GatewayError::with_status(401, "找不到该 Trae 账号"));
-    }
+    let account_proxy = super::adapter::account_proxy(&record)?;
+    let effective = proxy.or(account_proxy);
     let mut credential = Credential::from_payload(&record).map_err(GatewayError::new)?;
-    credential = super::adapter::renew_if_due(ctx, &record, &credential, proxy.as_ref()).await?;
+    credential =
+        super::adapter::renew_if_due(ctx, &record, &credential, effective.as_ref()).await?;
+    if super::credentials::is_intl_variant(credential.variant()) {
+        return Err(GatewayError::with_status(
+            400,
+            super::credentials::INTL_UNSUPPORTED,
+        ));
+    }
+    let requested = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let wire_model = if req.wire_model.trim().is_empty() {
+        requested
+    } else {
+        req.wire_model.trim()
+    };
+    let outcome = models::refresh(&credential, effective.as_ref(), false).await;
+    if let Some(reason) = outcome.message.as_deref() {
+        logging::verbose("[Trae]", &format!("请求路由目录未刷新：{reason}"));
+    }
+    let mut routes = models::routes_for(&credential, wire_model);
+    if routes.is_empty() {
+        if outcome.message.is_none() {
+            return Err(GatewayError::with_status(
+                404,
+                "Trae 当前账号的目录没有该模型，请重新获取模型或调整绑定",
+            ));
+        }
+        if payload::is_max_variant(wire_model) {
+            return Err(GatewayError::with_status(
+                404,
+                "Trae 目录没有该模型的 Max 档位，已拒绝以普通模型代替",
+            ));
+        }
+        let config = payload::sanitize_model_name(wire_model);
+        let config = if config.is_empty() {
+            payload::DEFAULT_CONFIG_NAME
+        } else {
+            &config
+        };
+        routes.push(Route::fallback(config, payload::PRIMARY_FUNCTION));
+    }
+    let session = session_id(body, &req.session, account_id)?;
     let limit = Limit {
         ctx,
         account_id: account_id.to_string(),
-        model: body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        model: requested.to_string(),
     };
-    let account_proxy = super::adapter::account_proxy(&record)?;
-    let effective = proxy.or(account_proxy);
-
-    let mut plan = build_plan(&credential, body, base)?;
     let capture = telemetry.capture();
-    if let Some(capture) = capture.as_deref() {
-        capture.reset_request(&plan.url, PROVIDER_ID, &plan.headers, body);
+    let mut renewed = false;
+    let mut last_error = None;
+    for route in routes {
+        let mut plan = build_plan(&credential, body, base, &route, &session)?;
+        if let Some(capture) = capture.as_deref() {
+            capture.reset_request(&plan.url, PROVIDER_ID, &plan.headers, &plan.body);
+        }
+        let mut response = send(&plan, effective.as_ref()).await?;
+        loop {
+            let status = response.status().as_u16();
+            if let Some(capture) = capture.as_deref() {
+                capture.attach_response(status, response.headers());
+            }
+            let json_response = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("application/json"));
+            let prepared = if status >= 300 || json_response {
+                Err(http_error(status, response).await)
+            } else {
+                prefetch_head(response).await
+            };
+            match prepared {
+                Ok((prefetched, source, mut solo, scanner)) => {
+                    models::remember_route(&credential, wire_model, &route);
+                    if !stream {
+                        let completion = match drive_aggregate(
+                            source, &mut solo, scanner, prefetched, requested, &telemetry,
+                        )
+                        .await
+                        {
+                            Ok(completion) => completion,
+                            Err(error) => return Err(final_error(error, &limit).await),
+                        };
+                        let payload = serde_json::to_vec(&completion).map_err(|error| {
+                            GatewayError::with_status(
+                                500,
+                                format!("Trae 聚合结果序列化失败：{error}"),
+                            )
+                        })?;
+                        sink.head(proto::StreamHead {
+                            status: 200,
+                            headers: [("content-type".to_string(), "application/json".to_string())]
+                                .into_iter()
+                                .collect(),
+                            upstream: proto::UpstreamKind::Chat,
+                        })
+                        .await
+                        .map_err(|error| GatewayError::with_status(499, error))?;
+                        sink.send(&payload)
+                            .await
+                            .map_err(|error| GatewayError::with_status(499, error))?;
+                        return Ok(());
+                    }
+                    sink.head(proto::StreamHead {
+                        status: 200,
+                        headers: [("content-type".to_string(), "text/event-stream".to_string())]
+                            .into_iter()
+                            .collect(),
+                        upstream: proto::UpstreamKind::Chat,
+                    })
+                    .await
+                    .map_err(|error| GatewayError::with_status(499, error))?;
+                    drive_stream(
+                        source, &mut solo, scanner, prefetched, requested, &telemetry, sink,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(error) if error.status_code == 401 && !renewed => {
+                    let record = crate::store::record(ctx, PROVIDER_ID, account_id).await?;
+                    let current = Credential::from_payload(&record).map_err(GatewayError::new)?;
+                    credential =
+                        super::adapter::renew_forced(ctx, &record, &current, effective.as_ref())
+                            .await?;
+                    renewed = true;
+                    plan = build_plan(&credential, body, base, &route, &session)?;
+                    if let Some(capture) = capture.as_deref() {
+                        capture.reset_request(&plan.url, PROVIDER_ID, &plan.headers, &plan.body);
+                    }
+                    response = send(&plan, effective.as_ref()).await?;
+                }
+                Err(error)
+                    if super::errors::retry_route(status, error.upstream_code, &error.message) =>
+                {
+                    logging::verbose(
+                        "[Trae]",
+                        &format!(
+                            "通道 {} 不可用，尝试同模型下一条目录路由：{}",
+                            route.function, error.message
+                        ),
+                    );
+                    last_error = Some(error);
+                    break;
+                }
+                Err(error) => return Err(final_error(error, &limit).await),
+            }
+        }
     }
-    let mut response = send(&plan, effective.as_ref()).await?;
-    // 401 只救一次：强制换发后重发（这条路径不换号，见模块头）。
-    if response.status().as_u16() == 401 {
-        let _ = response.text().await;
-        credential = super::adapter::renew_forced(ctx, &record, &credential, effective.as_ref()).await?;
-        plan = build_plan(&credential, body, base)?;
-        response = send(&plan, effective.as_ref()).await?;
-    }
-    let status = response.status().as_u16();
-    if status >= 400 {
-        return Err(http_error(status, response, &limit).await);
-    }
-    if let Some(capture) = capture.as_deref() {
-        capture.attach_response(status, response.headers());
-    }
-
-    if !stream {
-        // 上游恒流式，因此非流式是"我们这边聚合"（与 Accio 同结构）。
-        let completion =
-            drive_aggregate(response, plan.requested_model.clone(), &telemetry, &limit).await?;
-        let payload = serde_json::to_string(&completion).map_err(|error| {
-            GatewayError::with_status(500, format!("Trae 聚合结果序列化失败：{error}"))
-        })?;
-        sink.head(proto::StreamHead {
-            status: 200,
-            headers: [("content-type".to_string(), "application/json".to_string())]
-                .into_iter()
-                .collect(),
-            upstream: proto::UpstreamKind::Chat,
-        })
-        .await
-        .map_err(|error| GatewayError::with_status(499, error))?;
-        sink.send(payload.as_bytes())
-            .await
-            .map_err(|error| GatewayError::with_status(499, error))?;
-        return Ok(());
-    }
-
-    let (prefetched, source, mut solo) = prefetch_head(response, &limit).await?;
-    // 先报头（协议里没有「返回一个流」的槽位）
-    sink.head(proto::StreamHead {
-        status: 200,
-        headers: [(
-            "content-type".to_string(),
-            "text/event-stream".to_string(),
-        )]
-        .into_iter()
-        .collect(),
-        upstream: proto::UpstreamKind::Chat,
-    })
-    .await
-    .map_err(|error| GatewayError::with_status(499, error))?;
-    let requested = plan.requested_model.clone();
-    drive_stream(source, &mut solo, prefetched, &requested, &telemetry, sink).await;
-    Ok(())
+    let error =
+        last_error.unwrap_or_else(|| GatewayError::with_status(404, "Trae 没有可用的模型通道"));
+    Err(final_error(error, &limit).await)
 }
 
 /// 流式下发（在 spawn 的后台任务里跑）。
 async fn drive_stream(
     mut source: futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>,
     solo: &mut SoloStream,
+    mut scanner: ByteLines,
     prefetched: Vec<Frame>,
     requested: &str,
     telemetry: &RequestTelemetry,
     sink: &mut ConversationSink<'_>,
 ) {
-    let mut scanner = ByteLines::default();
     let mut usage_seen: Option<Value> = None;
     for frame in prefetched {
         note(&frame, telemetry, &mut usage_seen);
@@ -457,11 +609,35 @@ async fn drive_stream(
             }
         }
     }
+    if solo.completed() {
+        return;
+    }
     while let Some(item) = source.next().await {
         match item {
             Err(error) => {
-                telemetry.note_error(&format!("Trae 上游流中断: {error}"));
-                // 传输中断：客户端已收到部分内容，只能在流里收尾
+                if let Some(line) = scanner.finish() {
+                    for frame in solo.feed_line(&line) {
+                        note(&frame, telemetry, &mut usage_seen);
+                        if let Some(text) = render(&frame, requested) {
+                            if sink.send(text.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                for frame in solo.flush_pending() {
+                    note(&frame, telemetry, &mut usage_seen);
+                    if let Some(text) = render(&frame, requested) {
+                        if sink.send(text.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let message = format!("Trae 上游流中断: {error}");
+                telemetry.note_error(&message);
+                let failure = crate::sse::error_bytes(&message);
+                let _ = sink.send(&failure).await;
+                let _ = sink.send(&crate::sse::done_bytes()).await;
                 return;
             }
             Ok(chunk) => {
@@ -474,13 +650,41 @@ async fn drive_stream(
                             }
                         }
                     }
+                    if solo.completed() {
+                        return;
+                    }
                 }
             }
         }
     }
-    // EOF 收尾：上游没给过 `done` 时由 `finish()` 补那一个 `[DONE]`。
-    // 这里**不再自己添一个** —— `[DONE]` 必须恰好一个，而 `SoloStream` 已经
-    // 保证「done / error / EOF 三条路各发一次且只一次」。
+    if let Some(line) = scanner.finish() {
+        for frame in solo.feed_line(&line) {
+            note(&frame, telemetry, &mut usage_seen);
+            if let Some(text) = render(&frame, requested) {
+                if sink.send(text.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    // 尾事件可能就是完成通知，必须先解析，再决定是否报告截断。
+    for frame in solo.flush_pending() {
+        note(&frame, telemetry, &mut usage_seen);
+        if let Some(text) = render(&frame, requested) {
+            if sink.send(text.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+    if require_terminal() && solo.missing_terminal() {
+        telemetry.note_error(MISSING_TERMINAL);
+        let failure = crate::sse::sse_bytes(&json!({
+            "error": { "message": MISSING_TERMINAL, "type": "upstream_error" }
+        }));
+        if sink.send(&failure).await.is_err() {
+            return;
+        }
+    }
     for frame in solo.finish() {
         note(&frame, telemetry, &mut usage_seen);
         if let Some(text) = render(&frame, requested) {
@@ -502,7 +706,9 @@ fn note(frame: &Frame, telemetry: &RequestTelemetry, usage_seen: &mut Option<Val
             // 取**内层**才对得上 `extract_usage` 的那三把键 —— 报外层的后果是
             // 账目静默为 0（`extract_usage` 找不到 `prompt_tokens` 就整个返回 None）。
             let inner = chunk.get("usage").and_then(|value| value.get("usage"));
-            let usage = inner.or_else(|| chunk.get("usage")).or_else(|| chunk.get("token_usage"));
+            let usage = inner
+                .or_else(|| chunk.get("usage"))
+                .or_else(|| chunk.get("token_usage"));
             if let Some(usage) = usage {
                 *usage_seen = Some(usage.clone());
                 telemetry.report_usage(usage);
@@ -515,39 +721,82 @@ fn note(frame: &Frame, telemetry: &RequestTelemetry, usage_seen: &mut Option<Val
     }
 }
 
-/// 非流式：内部仍按流式拉全，再折成一个 `chat.completion`。
-async fn drive_aggregate(
-    response: reqwest::Response,
-    requested: String,
-    telemetry: &RequestTelemetry,
-    limit: &Limit<'_>,
-) -> Result<Value, GatewayError> {
-    let source = response.bytes_stream().map(|item| item.map_err(|error| io::Error::other(egress::describe_chain(&error))));
-    let mut source = stall::idle_guard(Box::pin(source), stream_idle());
-    let mut scanner = ByteLines::default();
-    let mut text = String::new();
-    while let Some(item) = source.next().await {
-        let chunk = item.map_err(|error| GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}")))?;
-        for line in scanner.push(&chunk) {
-            text.push_str(&line);
-            text.push('\n');
-        }
-    }
-    match super::stream::aggregate(&text, &request_id(), logging::now_ms() / 1000) {
-        Ok(mut completion) => {
-            if !requested.is_empty() {
-                if let Some(object) = completion.as_object_mut() {
-                    object.insert("model".to_string(), Value::String(requested));
-                }
-            }
-            if let Some(usage) = completion.get("usage") {
-                telemetry.report_usage(usage);
-            }
-            Ok(completion)
-        }
-        // 流内错误：与流式同一张状态码表（这里换号是没用的，但**必须**带状态，
-        // 否则客户端拿到的是 200 + 空内容 —— 参考实现摔过的正是这一种）。
-        Err(error) => Err(frame_error(error.code, &error.message, limit).await),
-    }
+/// 有客户端会话标识时按账号隔离；没有时使用首条用户消息，工具回灌不另起会话。
+fn session_id(body: &Value, session: &str, account: &str) -> Result<String, GatewayError> {
+    use sha2::{Digest, Sha256};
+    let first = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|message| message.get("content"));
+    let seed = if !session.trim().is_empty() {
+        format!("session:{}", session.trim())
+    } else if let Some(first) = first {
+        format!("message:{first}")
+    } else {
+        return super::oauth::uuid_v4().map_err(GatewayError::new);
+    };
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("trae:{account}:{seed}").as_bytes())
+    );
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &digest[..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32]
+    ))
 }
 
+/// 非流式也经过首包门，已开始返回的内容不会因为后续错误重发。
+async fn drive_aggregate(
+    mut source: futures::stream::BoxStream<'static, Result<bytes::Bytes, io::Error>>,
+    solo: &mut SoloStream,
+    mut scanner: ByteLines,
+    prefetched: Vec<Frame>,
+    requested: &str,
+    telemetry: &RequestTelemetry,
+) -> Result<Value, GatewayError> {
+    let mut frames = prefetched;
+    while !solo.completed() {
+        let Some(item) = source.next().await else {
+            break;
+        };
+        let chunk = item.map_err(|error| {
+            GatewayError::with_status(502, format!("Trae 上游流式传输中断: {error}"))
+        })?;
+        for line in scanner.push(&chunk) {
+            frames.extend(solo.feed_line(&line));
+            if solo.completed() {
+                break;
+            }
+        }
+    }
+    if !solo.completed() {
+        if let Some(line) = scanner.finish() {
+            frames.extend(solo.feed_line(&line));
+        }
+        frames.extend(solo.finish());
+    }
+    let mut usage_seen = None;
+    let mut chunks = Vec::new();
+    for frame in frames {
+        note(&frame, telemetry, &mut usage_seen);
+        match frame {
+            Frame::Error { code, message, .. } => return Err(frame_error(code, &message)),
+            Frame::Chunk(chunk) => chunks.push(chunk),
+            Frame::Done => {}
+        }
+    }
+    if require_terminal() && solo.missing_terminal() {
+        telemetry.note_error(MISSING_TERMINAL);
+        return Err(GatewayError::with_status(502, MISSING_TERMINAL));
+    }
+    Ok(super::stream::aggregate_chunks(&chunks, requested))
+}

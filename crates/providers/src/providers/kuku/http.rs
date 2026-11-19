@@ -17,7 +17,7 @@
 
 use serde_json::Value;
 
-use crate::http::send_raw;
+use crate::http::{send_raw, AccountRequest};
 use crate::errors::GatewayError;
 
 /// JSON 请求的默认超时（登录 / 换证 / 建会话这类管理接口，30 秒足够）
@@ -102,7 +102,7 @@ pub async fn post_form_value(
     proxy: Option<&agent2api_provider_protocol::WireProxy>,
     timeout_ms: Option<u64>,
 ) -> Result<Value, GatewayError> {
-    let client = crate::http::client(proxy, "direct");
+    let client = crate::http::control_client(proxy, "direct");
     let mut builder = client
         .post(url)
         .header("Accept", "application/json, text/plain, */*")
@@ -123,6 +123,7 @@ pub async fn post_form_value(
         builder = builder.timeout(std::time::Duration::from_millis(timeout));
     }
     let response = builder
+        .with_account_user_agent()
         .send()
         .await
         .map_err(|error| transport_error("KukuAI 请求", error))?;
@@ -151,13 +152,14 @@ pub async fn sse_post(
     proxy: Option<&agent2api_provider_protocol::WireProxy>,
     what: &str,
 ) -> Result<reqwest::Response, GatewayError> {
-    let client = crate::http::client(proxy, "direct");
+    let client = crate::http::stream_client(proxy, "direct");
     let mut request = client.post(url).header("Accept", "text/event-stream");
     for (name, value) in headers {
         request = request.header(name.as_str(), value);
     }
     let response = request
         .json(body)
+        .with_account_user_agent()
         .send()
         .await
         .map_err(|error| transport_error(what, error))?;

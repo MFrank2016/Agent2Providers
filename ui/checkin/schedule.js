@@ -565,7 +565,8 @@ function travelPanel(snapshot) {
   const times = travel.times || [];
   const fired = travel.firedToday || [];
   const saving = store.travelSaving === true;
-  const running = store.travelRunning === true;
+  const running = store.travelRunning === true || travel.running === true;
+  const paused = travel.available === false;
 
   // 草稿：null = 跟随快照（用户没在编辑）。与旧实现同一套判定 ——
   // 去掉空白后与快照相同就不算改动。
@@ -609,12 +610,13 @@ function travelPanel(snapshot) {
       el('span', { class: 'head-actions' },
         button(running ? '巡检中…' : '立即巡检全部', {
           tone: 'outline',
-          disabled: running,
+          disabled: running || saving || paused,
           onClick: () => void runTravelNowOnce(),
         }),
       ),
     ),
     el('div', { class: 'ck-panel-pad' },
+      paused ? el('div', { class: 'ck-note' }, `自动巡检已暂停：${travel.pausedReason || ''}`) : null,
       el('div', { class: 'ck-set-line' },
         el('span', { class: 'ck-set-k', text: '开关' }),
         el('span', { class: 'ck-set-v ck-set-row' },
@@ -648,10 +650,12 @@ function travelPanel(snapshot) {
         '北京时间 · 逗号分隔 · 最多 6 条 · 到点后最多晚 30 秒执行；错过时点开机后会补跑一轮。'
           + (fired.length ? ` 今天已执行：${fired.join(' / ')}` : ''),
       ),
-      last && actions.length
+      last && (actions.length || last.error)
         ? el('div', { class: 'ck-note' },
-          `上一轮（${last.at ? formatTime(Number(last.at)) : ''}）：`
+          last.error ? `巡检失败：${last.error}` :
+            `上一轮（${last.at ? formatTime(Number(last.at)) : ''}）：`
             + `${actions.length} 个动作，+${Number(last.credit) || 0} 积分`
+            + (Number(last.failed) > 0 ? ` · 失败 ${Number(last.failed)}` : '')
             + actions.slice(0, 6)
               .map(action => ` · ${action.name ?? action.accountId ?? ''}: ${action.message ?? action.outcome ?? ''}`)
               .join(''),
@@ -717,8 +721,17 @@ export function renderSchedule(container) {
   const children = [
     el('section', { class: 'panel' }, head, el('div', { class: 'ck-panel-pad' }, masterLine), list),
   ];
-  // 两块地区专属面板：由插件申报的 admin_panels 决定
-  if (snapshot && panels.has('daily_keepalive')) children.push(keepalivePanel(snapshot));
-  if (snapshot && panels.has('growth_tasks')) children.push(travelPanel(snapshot));
+  // 两块地区专属面板：由插件申报的 admin_panels 决定。
+  // 国内版与国际版默认都启用，所以两块**会同时出现** —— 那种情况收进同一行分栏
+  // （左保活模型链 / 右猫猫旅行排程）。各自独占整行时每张卡的下半截都是空的。
+  // 只有一块时不套容器：单块仍按原来的形态（模型链半幅、旅行排程整行）。
+  const regions = [];
+  if (snapshot && panels.has('daily_keepalive')) regions.push(keepalivePanel(snapshot));
+  if (snapshot && panels.has('growth_tasks')) regions.push(travelPanel(snapshot));
+  if (regions.length > 1) {
+    children.push(el('div', { class: 'ck-region-row' }, ...regions));
+  } else {
+    children.push(...regions);
+  }
   fill(container, el('div', { class: 'ck-main' }, ...children));
 }

@@ -33,7 +33,9 @@ use serde_json::Value;
 use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 
 use crate::ctx::{CallGateway, PluginCtx, StoreError};
+pub use crate::errors::{control_error_with_sign_in, control_error_with_timing};
 use crate::provider::{BoxProvider, ConversationSink, Provider, SinkInner};
+pub use crate::serve_options::{serve_blocking, serve_blocking_with, ServeOptions};
 
 /// 全局宿主句柄（供 `log_info!` 这类宏在任意位置打日志）。
 static HOST: OnceLock<Arc<Serve>> = OnceLock::new();
@@ -42,24 +44,13 @@ static HOST: OnceLock<Arc<Serve>> = OnceLock::new();
 ///
 /// 正常退出（stdin EOF 或收到 `shutdown`）返回 `Ok(())`。
 pub async fn serve(providers: Vec<BoxProvider>) -> std::io::Result<()> {
-    let host = Arc::new(Serve::new(providers));
-    let _ = HOST.set(host.clone());
-    host.run().await
+    serve_with(providers, ServeOptions::default()).await
 }
 
-/// 启动插件主循环（自己建运行时，给 `fn main()` 用）。
-pub fn serve_blocking(providers: Vec<BoxProvider>) {
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("provider host: 建 tokio 运行时失败: {e}");
-            std::process::exit(2);
-        }
-    };
-    if let Err(e) = runtime.block_on(serve(providers)) {
-        eprintln!("provider host: 主循环异常退出: {e}");
-        std::process::exit(1);
-    }
+pub async fn serve_with(providers: Vec<BoxProvider>, options: ServeOptions) -> std::io::Result<()> {
+    let host = Arc::new(Serve::new(providers, options));
+    let _ = HOST.set(host.clone());
+    host.run().await
 }
 
 /// 打一条日志到网关（由 `log_info!` 等宏调用）。
@@ -71,6 +62,7 @@ pub fn emit_log(level: &str, message: String) {
     };
     let host = host.clone();
     let level = level.to_string();
+    let context = crate::log_context::current();
     // 不等待：日志是旁路，阻塞业务不值得。写失败也无所谓。
     tokio::spawn(async move {
         let frame = proto::Frame {
@@ -78,6 +70,7 @@ pub fn emit_log(level: &str, message: String) {
             event: Some("log".into()),
             level: Some(level),
             message: Some(message),
+            params: Some(context),
             ..Default::default()
         };
         host.write(frame).await.ok();
@@ -109,10 +102,14 @@ impl Cancel {
 
     /// 等到被取消（已经取消时立刻返回）。
     pub async fn cancelled(&self) {
+        // 先登记等待者再读 flag，避免 notify_waiters 在两者之间发生而丢失唤醒。
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 
@@ -128,10 +125,12 @@ pub(crate) struct Serve {
     next_id: AtomicI64,
     /// 运行环境（`init` 时填）。
     env: RwLock<Option<proto::HostEnv>>,
+    options: ServeOptions,
     /// 在途的流式调用：id → (取消信号, 额度池)。
     running: Mutex<HashMap<i64, Running>>,
     /// 正在关闭。
     closing: AtomicBool,
+    cleanup: Mutex<Option<Result<(), String>>>,
 }
 
 /// 一条在途流式调用的状态。
@@ -141,15 +140,17 @@ struct Running {
 }
 
 impl Serve {
-    fn new(providers: Vec<BoxProvider>) -> Self {
+    fn new(providers: Vec<BoxProvider>, options: ServeOptions) -> Self {
         Self {
             providers: providers.into_iter().map(Arc::from).collect(),
             out: Mutex::new(tokio::io::stdout()),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
             env: RwLock::new(None),
+            options,
             running: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
+            cleanup: Mutex::new(None),
         }
     }
 
@@ -158,14 +159,63 @@ impl Serve {
         proto::write_frame(&mut *out, &frame).await
     }
 
+    async fn write_stream_frame(
+        self: &Arc<Self>, frame: proto::Frame, cancel: Arc<Cancel>,
+    ) -> std::io::Result<()> {
+        // 取消前已开始的帧写完；尚未开始的帧跳过，不能迟到在 ABORTED 后面。
+        let host = self.clone();
+        tokio::spawn(async move {
+            let mut out = host.out.lock().await;
+            if cancel.is_cancelled() {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "调用已被取消"));
+            }
+            proto::write_frame(&mut *out, &frame).await
+        }).await.map_err(std::io::Error::other)?
+    }
+
+    /// 回一个成功应答。
+    ///
+    /// ── 写失败为什么要降级成 error 帧再试一次 ────────────────────
+    /// 原先这里 `let _ = self.write(frame).await;` 把错误整个丢掉，于是
+    /// 「结果帧太大写不出去」在插件侧完全静默 —— 网关等不到应答，最后
+    /// 表现为一条超时，与真正的原因（帧超限）毫无关系（issue #15 的排查
+    /// 成本主要就花在这上面）。
+    ///
+    /// 现在分两步：写成功就结束；写失败时**换一条 error 帧重试** —— 错误
+    /// 帧只有一个短文案，体积恒定，几乎不可能再超限，于是网关能收到一句
+    /// 「为什么失败」而不是干等到超时。两次都失败（管道真的断了）就只能
+    /// 放弃：那种情况下对端已经不在了，再试也没有接收方。
     async fn reply(&self, id: i64, result: Value) {
         let frame = proto::Frame { id, result: Some(result), ..Default::default() };
-        let _ = self.write(frame).await;
+        if let Err(error) = self.write(frame).await {
+            let fallback = proto::Frame {
+                id,
+                error: Some(proto::WireError::with_code(
+                    format!("插件无法回写应答：{error}"),
+                    proto::WireError::INTERNAL,
+                )),
+                ..Default::default()
+            };
+            let _ = self.write(fallback).await;
+        }
     }
 
     async fn reply_err(&self, id: i64, error: proto::WireError) {
         let frame = proto::Frame { id, error: Some(error), ..Default::default() };
         let _ = self.write(frame).await;
+    }
+
+    async fn shutdown_providers(&self) -> Result<(), String> {
+        let mut cleanup = self.cleanup.lock().await;
+        if let Some(result) = cleanup.as_ref() { return result.clone(); }
+        self.closing.store(true, Ordering::Release);
+        for running in self.running.lock().await.values() { running.cancel.cancel(); }
+        let mut result = Ok(());
+        for provider in &self.providers {
+            if let Err(error) = provider.shutdown().await { if result.is_ok() { result = Err(error); } }
+        }
+        *cleanup = Some(result.clone());
+        result
     }
 
     async fn run(self: &Arc<Self>) -> std::io::Result<()> {
@@ -197,12 +247,13 @@ impl Serve {
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     // 帧坏了：不能信任后续字节边界，退出让网关重启我们
                     eprintln!("provider host: 帧格式错误，退出: {e}");
+                    let _ = self.shutdown_providers().await;
                     return Err(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => { let _ = self.shutdown_providers().await; return Err(e); }
             }
         }
-        Ok(())
+        self.shutdown_providers().await.map_err(std::io::Error::other)
     }
 
     /// 派发一个请求到独立 task。
@@ -236,8 +287,15 @@ impl Serve {
             return;
         }
 
+        let context = crate::log_context::capture(id, &method, &params);
+        let timeouts = serde_json::from_value::<crate::timeouts::Timeouts>(
+            params.get("timeouts").cloned().unwrap_or(Value::Null),
+        ).unwrap_or_default();
         tokio::spawn(async move {
-            host.handle(id, &method, params).await;
+            crate::timeouts::scope(
+                timeouts,
+                crate::log_context::scope(context, host.handle(id, &method, params)),
+            ).await;
         });
     }
 
@@ -247,15 +305,13 @@ impl Serve {
             proto::methods::gateway::INIT => self.handle_init(id, params).await,
             proto::methods::gateway::PING => self.reply(id, Value::Null).await,
             proto::methods::gateway::SHUTDOWN => {
-                self.closing.store(true, Ordering::Release);
-                self.reply(id, Value::Null).await;
-                // 让在途的流式调用收尾
-                let running: Vec<Arc<Cancel>> =
-                    self.running.lock().await.values().map(|r| r.cancel.clone()).collect();
-                for cancel in running {
-                    cancel.cancel();
+                match self.shutdown_providers().await {
+                    Ok(()) => {
+                        self.reply(id, Value::Null).await;
+                        std::process::exit(0);
+                    }
+                    Err(message) => self.reply_err(id, crate::errors::to_wire_error(message)).await,
                 }
-                std::process::exit(0);
             }
             proto::methods::gateway::CONVERSATION => self.handle_conversation(id, params).await,
             other => self.handle_control(id, other, params).await,
@@ -279,6 +335,23 @@ impl Serve {
                 return;
             }
         };
+        if let Some(on_init) = self.options.on_init {
+            let initialized = tokio::task::spawn_blocking({
+                let env = env.clone();
+                move || on_init(&env)
+            }).await;
+            let error = match initialized {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = error {
+                self.reply_err(id, proto::WireError::with_code(
+                    format!("插件运行环境初始化失败: {error}"), proto::WireError::INTERNAL,
+                )).await;
+                return;
+            }
+        }
         *self.env.write().await = Some(env);
         let infos: Vec<proto::ProviderInfo> = self
             .providers
@@ -305,7 +378,31 @@ impl Serve {
             })
             .collect();
         match serde_json::to_value(&infos) {
-            Ok(value) => self.reply(id, value).await,
+            Ok(mut value) => {
+                if let Some(infos) = value.as_array_mut() {
+                    for (info, provider) in infos.iter_mut().zip(&self.providers) {
+                        if let Some(schema) = provider.settings_schema() {
+                            match serde_json::to_value(schema) {
+                                Ok(schema) => info["settings_schema"] = schema,
+                                Err(_) => {
+                                    self.reply_err(id, proto::WireError::with_code("插件设置声明无法序列化", proto::WireError::INTERNAL)).await;
+                                    return;
+                                }
+                            }
+                            if let Some(group) = provider.settings_group() {
+                                match serde_json::to_value(group) {
+                                    Ok(group) => info["settings_group"] = group,
+                                    Err(_) => {
+                                        self.reply_err(id, proto::WireError::with_code("插件设置分组无法序列化", proto::WireError::INTERNAL)).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.reply(id, value).await;
+            }
             Err(e) => {
                 self.reply_err(
                     id,
@@ -322,6 +419,18 @@ impl Serve {
     /// 控制面方法（全部一问一答）。
     async fn handle_control(self: &Arc<Self>, id: i64, method: &str, params: Value) {
         let Some(provider) = self.provider_of(&params) else {
+            self.handle_control_scoped(id, method, params).await;
+            return;
+        };
+        let ctx = self.ctx(&provider.provider_id());
+        match crate::egress::for_request(&ctx, method, &params).await {
+            Ok(route) => crate::egress::scope(route, self.handle_control_scoped(id, method, params)).await,
+            Err(message) => self.reply_err(id, crate::errors::to_wire_error(message)).await,
+        }
+    }
+
+    async fn handle_control_scoped(self: &Arc<Self>, id: i64, method: &str, params: Value) {
+        let Some(provider) = self.provider_of(&params) else {
             self.reply_err(
                 id,
                 proto::WireError::with_code(
@@ -332,22 +441,66 @@ impl Serve {
             .await;
             return;
         };
-        let ctx = self.ctx();
+        let ctx = self.ctx(&provider.provider_id());
         let account = params.get("account").and_then(Value::as_str).unwrap_or("").to_string();
 
         let outcome: Result<Value, String> = match method {
+            crate::settings::OVERRIDES_METHOD => Ok(provider.settings_overrides()),
+            "native.helpers" => Ok(Value::Array(provider.native_helpers())),
+            "native.call" => provider.native_call(&ctx, params["caller"].as_str().unwrap_or(""),
+                params["helper"].as_str().unwrap_or(""), params["operation"].as_str().unwrap_or(""), &params["payload"]).await,
+            crate::provider::SCHEDULES_LIST_METHOD => {
+                serde_json::to_value(provider.schedules())
+                    .map_err(|error| format!("排程申报无法序列化: {error}"))
+            }
             proto::methods::gateway::CHAT => {
                 match serde_json::from_value::<proto::ChatRequest>(params.clone()) {
-                    Ok(req) => match provider.build_chat(&ctx, req).await {
-                        Ok(plan) => Ok(serde_json::json!({
-                            "url": plan.url,
-                            "headers": plan.headers,
-                            "body": plan.body,
-                            "upstream": plan.upstream,
-                        })),
+                    Ok(req) => match crate::extensions::with_direct_proxy_override(
+                        params.get("proxy_override").and_then(Value::as_bool) == Some(true),
+                        provider.build_chat(&ctx, req),
+                    ).await {
+                        Ok(plan) => {
+                            let reasoning = provider.outbound_reasoning(&plan.body);
+                            let policy = provider.chat_policy(&plan.body);
+                            let mut value = serde_json::json!({
+                                "url": plan.url,
+                                "headers": plan.headers,
+                                "body": plan.body,
+                                "upstream": plan.upstream,
+                            });
+                            if let Some(reasoning) = reasoning {
+                                value["reasoning"] = serde_json::json!(reasoning);
+                            }
+                            if !policy.is_null() {
+                                value["policy"] = policy;
+                            }
+                            Ok(value)
+                        }
                         Err(e) => Err(e),
                     },
                     Err(e) => Err(format!("chat 参数无法解析: {e}")),
+                }
+            }
+            crate::images::CAPABILITIES_METHOD => {
+                Ok(serde_json::json!({
+                    "generation": provider.supports_image_generation(),
+                    "editing": provider.supports_image_editing(),
+                }))
+            }
+            crate::images::GENERATE_METHOD | crate::images::EDIT_METHOD => {
+                match serde_json::from_value::<crate::images::ImageRequest>(params.clone()) {
+                    Ok(req) => {
+                        let result = if method == crate::images::EDIT_METHOD {
+                            provider.build_image_edit(&ctx, req).await
+                        } else {
+                            provider.build_image(&ctx, req).await
+                        };
+                        result.and_then(|plan| serde_json::to_value(plan)
+                            .map_err(|error| format!("图片请求计划无法序列化: {error}")))
+                    }
+                    Err(error) => Err(crate::control_error(
+                        400, format!("图片请求参数无法解析: {error}"), None, None,
+                    )),
                 }
             }
             proto::methods::gateway::CLASSIFY => {
@@ -355,6 +508,11 @@ impl Serve {
                 let body = params.get("body").cloned().unwrap_or(Value::Null);
                 serde_json::to_value(provider.classify(status, &body))
                     .map_err(|e| format!("分类结果无法序列化: {e}"))
+            }
+            crate::extensions::ERROR_POLICY_METHOD => {
+                let status = params.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
+                let body = params.get("body").cloned().unwrap_or(Value::Null);
+                Ok(provider.error_policy(status, &body))
             }
             proto::methods::gateway::IS_ERROR_RESPONSE => {
                 let status = params.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
@@ -367,6 +525,14 @@ impl Serve {
             proto::methods::gateway::REFUSAL_MARKERS => {
                 let (finishes, markers) = provider.refusal_markers();
                 Ok(serde_json::json!({ "finishes": finishes, "markers": markers }))
+            }
+            crate::retry::RETRY_DECISION_METHOD => {
+                let status = params.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
+                let body = params.get("body").cloned().unwrap_or(Value::Null);
+                let attempt = params.get("attempt").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let budget = params.get("budget").and_then(Value::as_u64).unwrap_or(0) as usize;
+                serde_json::to_value(provider.retry_decision(status, &body, attempt, budget))
+                    .map_err(|error| format!("重试决定无法序列化: {error}"))
             }
             proto::methods::gateway::RETRY_ADVICE => {
                 let body = params.get("body").cloned().unwrap_or(Value::Null);
@@ -382,8 +548,9 @@ impl Serve {
                 let level = params.get("level").and_then(Value::as_str).unwrap_or("");
                 let model = params.get("model").and_then(Value::as_str).unwrap_or("");
                 let body = params.get("body").cloned().unwrap_or(Value::Null);
-                serde_json::to_value(provider.reasoning_patch(level, model, &body))
-                    .map_err(|e| format!("档位结果无法序列化: {e}"))
+                provider.reasoning_patch_async(&ctx, level, model, &body).await
+                    .and_then(|patch| serde_json::to_value(patch)
+                        .map_err(|e| format!("档位结果无法序列化: {e}")))
             }
             proto::methods::gateway::COOLDOWN_MODELS => {
                 let wire = params.get("wire_model").and_then(Value::as_str).unwrap_or("");
@@ -404,14 +571,21 @@ impl Serve {
             ),
             proto::methods::gateway::MODELS_REFRESH => {
                 let force = params.get("force").and_then(Value::as_bool).unwrap_or(false);
-                provider.refresh_models(&ctx, &account, force).await.and_then(|outcome| {
-                    serde_json::to_value(outcome).map_err(|e| format!("刷新结果无法序列化: {e}"))
-                })
+                provider.refresh_models_snapshot(&ctx, &account, force).await
             }
-            proto::methods::gateway::USAGE_QUERY => provider.usage(&ctx, &account).await,
-            proto::methods::gateway::CHECKIN_CLAIM => provider.checkin(&ctx, &account).await.and_then(
-                |report| serde_json::to_value(report).map_err(|e| format!("签到结果无法序列化: {e}")),
-            ),
+            proto::methods::gateway::USAGE_QUERY => provider.usage(&ctx, &account).await.map(|mut report| {
+                let sources = provider.quota_sources(&report);
+                if let Some(object) = report.as_object_mut() {
+                    object.insert("quotaSources".to_string(), Value::Array(sources));
+                }
+                report
+            }),
+            proto::methods::gateway::CHECKIN_CLAIM => {
+                let manual = params.get("manual").and_then(Value::as_bool).unwrap_or(false);
+                crate::checkin::run(provider.as_ref(), &ctx, &account, manual).await.and_then(
+                    |report| serde_json::to_value(report).map_err(|e| format!("签到结果无法序列化: {e}")),
+                )
+            }
             proto::methods::gateway::CLAIM => {
                 let claim = params.get("claim").and_then(Value::as_str).unwrap_or("");
                 provider.claim(&ctx, &account, claim).await
@@ -422,7 +596,10 @@ impl Serve {
             }
             proto::methods::gateway::ADMIN_ACTION => {
                 let action = params.get("action").and_then(Value::as_str).unwrap_or("");
-                if action.trim().is_empty() {
+                if action == "network.user-agent" && self.options.account_user_agent.is_some() {
+                    Ok(serde_json::json!({ "accountWide": self.options.account_user_agent
+                        .is_some_and(|supports| supports(&provider.provider_id())) }))
+                } else if action.trim().is_empty() {
                     Err("admin.action 缺少 action".to_string())
                 } else {
                     let payload = params.get("payload").cloned().unwrap_or(Value::Null);
@@ -460,7 +637,7 @@ impl Serve {
             }
             proto::methods::gateway::LOGIN_CALLBACK => {
                 match serde_json::from_value::<proto::LoginCallback>(params.clone()) {
-                    Ok(callback) => provider.login_callback(&ctx, callback).await.and_then(|poll| {
+                    Ok(callback) => provider.login_callback_result(&ctx, callback).await.and_then(|poll| {
                         serde_json::to_value(poll).map_err(|e| format!("登录回调无法序列化: {e}"))
                     }),
                     Err(e) => Err(format!("callback 参数无法解析: {e}")),
@@ -485,22 +662,7 @@ impl Serve {
 
         match outcome {
             Ok(value) => self.reply(id, value).await,
-            Err(message) => {
-                // ── 两条分类，别再合并成一档 ───────────────────────────
-                //   · 带 `LOCAL_PRECONDITION:` 前缀的：请求还没出本机就注定
-                //     发不出去，网关要据此换下一个候选家顺延（见
-                //     `provider::local_precondition`）；
-                //   · 其余一律归 INTERNAL：它们多是上游/解析失败，网关会包
-                //     一层再决定要不要给用户看。
-                let error = match crate::provider::split_local_precondition(&message) {
-                    Some(detail) => proto::WireError::with_code(
-                        detail.to_string(),
-                        proto::WireError::LOCAL_PRECONDITION,
-                    ),
-                    None => proto::WireError::with_code(message, proto::WireError::INTERNAL),
-                };
-                self.reply_err(id, error).await;
-            }
+            Err(message) => self.reply_err(id, crate::errors::to_wire_error(message)).await,
         }
     }
 
@@ -517,7 +679,8 @@ impl Serve {
             .await;
             return;
         };
-        let req = match serde_json::from_value::<proto::ConversationRequest>(params) {
+        let ctx = self.ctx(&provider.provider_id());
+        let req = match serde_json::from_value::<proto::ConversationRequest>(params.clone()) {
             Ok(req) => req,
             Err(e) => {
                 self.reply_err(
@@ -539,7 +702,6 @@ impl Serve {
             .await
             .insert(id, Running { cancel: cancel.clone(), credit: credit.clone() });
 
-        let ctx = self.ctx();
         let mut sink = StreamSink {
             host: self.clone(),
             id,
@@ -549,20 +711,26 @@ impl Serve {
         };
         let result = {
             let view = ConversationSink::new(&mut sink);
-            provider.conversation(&ctx, req, view).await
+            // 不依赖 provider 自觉观察取消：drop Future 后清 running 与回调等待者。
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err("调用已被取消".to_string()),
+                result = async {
+                    let route = crate::egress::for_request(&ctx, proto::methods::gateway::CONVERSATION, &params).await?;
+                    crate::egress::scope(route, provider.conversation(&ctx, req, view)).await
+                } => result,
+            }
         };
 
         self.running.lock().await.remove(&id);
         match result {
+            _ if cancel.is_cancelled() => {
+                self.reply_err(id, proto::WireError::with_code(
+                    "调用已被取消", proto::WireError::ABORTED,
+                )).await;
+            }
             Ok(()) => self.reply(id, Value::Null).await,
-            Err(message) if cancel.is_cancelled() => {
-                self.reply_err(id, proto::WireError::with_code(message, proto::WireError::ABORTED))
-                    .await
-            }
-            Err(message) => {
-                self.reply_err(id, proto::WireError::with_code(message, proto::WireError::INTERNAL))
-                    .await
-            }
+            Err(message) => self.reply_err(id, crate::errors::to_wire_error(message)).await,
         }
     }
 
@@ -578,7 +746,7 @@ impl Serve {
         self.providers.iter().find(|p| p.provider_id() == id).cloned()
     }
 
-    fn ctx(self: &Arc<Self>) -> PluginCtx {
+    fn ctx(self: &Arc<Self>, provider: &str) -> PluginCtx {
         let env = self.env.try_read().ok().and_then(|guard| guard.clone()).unwrap_or_else(|| {
             proto::HostEnv {
                 data_dir: String::new(),
@@ -589,7 +757,7 @@ impl Serve {
                 loopback_port: 0,
             }
         });
-        PluginCtx { env, call: Arc::new(CallHandle { host: Some(self.clone()) }) }
+        PluginCtx { env, call: Arc::new(CallHandle { host: Some(self.clone()), provider: provider.to_string() }) }
     }
 
     /// 收下一条回调应答。
@@ -605,16 +773,35 @@ impl Serve {
     }
 }
 
+/// 在调用方取消回调 Future 时也清理 pending，避免子进程 abort 留下等待者。
+struct CallbackWaitGuard {
+    host: Arc<Serve>,
+    id: i64,
+}
+
+impl Drop for CallbackWaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.host.pending.try_lock() {
+            pending.remove(&self.id);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let host = self.host.clone();
+            let id = self.id;
+            runtime.spawn(async move { host.pending.lock().await.remove(&id); });
+        }
+    }
+}
+
 /// 回调发送端：`PluginCtx` 用它把请求发给网关并等应答。
 struct CallHandle {
     host: Option<Arc<Serve>>,
+    provider: String,
 }
 
 impl CallGateway for CallHandle {
     fn call<'a>(
         &'a self,
         method: &'a str,
-        params: Value,
+        mut params: Value,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, StoreError>> + Send + 'a>,
     > {
@@ -622,18 +809,37 @@ impl CallGateway for CallHandle {
             let Some(host) = &self.host else {
                 return Err(StoreError::Unavailable("插件宿主尚未启动".into()));
             };
+            if method == proto::methods::plugin::STORE_UPDATE {
+                let next = params.get("secret").cloned().unwrap_or(Value::Null);
+                if let Some(adapter) = host.provider_of(&serde_json::json!({ "provider": self.provider })) {
+                    if let Ok(public) = adapter.account_view(&next) {
+                        if let Some(fields) = params.as_object_mut() {
+                            fields.insert("public".to_string(), public);
+                        }
+                    }
+                }
+            }
             let id = host.next_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             host.pending.lock().await.insert(id, tx);
+            let _waiter = CallbackWaitGuard { host: host.clone(), id };
             let frame = proto::Frame {
                 id,
                 method: Some(method.to_string()),
                 params: Some(params),
                 ..Default::default()
             };
-            if let Err(e) = host.write(frame).await {
-                host.pending.lock().await.remove(&id);
-                return Err(StoreError::Unavailable(format!("写网关失败: {e}")));
+            // 回调 Future 可能被取消；实际写帧独立完成，不能留下半行 JSON。
+            let writing = {
+                let host = host.clone();
+                tokio::spawn(async move { host.write(frame).await })
+            };
+            match writing.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(StoreError::Unavailable(format!("写网关失败: {error}")));
+                }
+                Err(_) => return Err(StoreError::Unavailable("写网关任务退出".into())),
             }
             match rx.await {
                 Ok(Ok(value)) => Ok(value),
@@ -660,8 +866,15 @@ struct StreamSink {
 }
 
 impl SinkInner for StreamSink {
+    fn cancellation(&self) -> Arc<Cancel> {
+        self.cancel.clone()
+    }
+
     fn send_head<'a>(&'a mut self, head: proto::StreamHead) -> crate::provider::SendFuture<'a, ()> {
         Box::pin(async move {
+            if self.cancel.is_cancelled() {
+                return Err("调用已被取消".to_string());
+            }
             if self.head_sent {
                 return Err("head 只能发一次".to_string());
             }
@@ -682,7 +895,8 @@ impl SinkInner for StreamSink {
                 upstream,
                 ..Default::default()
             };
-            self.host.write(frame).await.map_err(|e| format!("写 head 失败: {e}"))
+            // 写帧不能中途取消，否则半行 JSON 会破坏其它请求的管道边界。
+            self.host.write_stream_frame(frame, self.cancel.clone()).await.map_err(|e| format!("写 head 失败: {e}"))
         })
     }
 
@@ -701,9 +915,12 @@ impl SinkInner for StreamSink {
                     return Err("调用已被取消".to_string());
                 }
                 let cost = piece.len() + proto::FRAME_OVERHEAD_BYTES;
-                let permit = match self.credit.clone().acquire_many_owned(cost as u32).await {
-                    Ok(permit) => permit,
-                    Err(_) => return Err("调用已被取消".to_string()),
+                let permit = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err("调用已被取消".to_string()),
+                    acquired = self.credit.clone().acquire_many_owned(cost as u32) => {
+                        acquired.map_err(|_| "调用已被取消".to_string())?
+                    }
                 };
                 // ── 为什么是 `forget()` 而不是 drop ─────────────────
                 // drop 会把额度**立刻还回信号量**，于是窗口永远是满的 ——
@@ -718,7 +935,7 @@ impl SinkInner for StreamSink {
                     data: Some(proto::encode_chunk(piece)),
                     ..Default::default()
                 };
-                self.host.write(frame).await.map_err(|e| format!("写 chunk 失败: {e}"))?;
+                self.host.write_stream_frame(frame, self.cancel.clone()).await.map_err(|e| format!("写 chunk 失败: {e}"))?;
             }
             Ok(())
         })

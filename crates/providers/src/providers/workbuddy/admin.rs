@@ -98,7 +98,7 @@ pub(super) async fn dispatch(
                     .collect()
             })
             .unwrap_or_default();
-        return super::keepalive::run(&record, mode, &models).await;
+        return super::keepalive::run(ctx, &record, mode, &models).await;
     }
     if action == "activity.run" {
         return Err(GatewayError::with_status(
@@ -109,7 +109,8 @@ pub(super) async fn dispatch(
     match action {
         "growth.status" | "growth.task" | "growth.school" | "growth.travel" => {
             let record = crate::store::record(ctx, provider_id, account).await?;
-            let growth_account = growth_account_of(&record)?;
+            let mut growth_account = growth_account_of(&record)?;
+            growth_account.ctx = Some(ctx.clone());
             match action {
                 "growth.status" => growth_status(account, &growth_account).await,
                 "growth.task" => growth_task(account, &growth_account, payload).await,
@@ -131,11 +132,12 @@ pub(super) async fn dispatch(
         // 每日活跃上报（点亮成长中心连登 / 活跃地图）
         "growth.daily" => {
             let record = crate::store::record(ctx, provider_id, account).await?;
-            let growth_account = growth_account_of(&record)?;
+            let mut growth_account = growth_account_of(&record)?;
+            growth_account.ctx = Some(ctx.clone());
             Ok(daily_report(&growth_account).await)
         }
         other => Err(GatewayError::with_status(
-            400,
+            501,
             format!(
                 "WorkBuddy 不认识管理动作「{other}」（可用：{}）",
                 ACTIONS.join(" / ")
@@ -229,7 +231,8 @@ async fn daily_report(account: &GrowthAccount) -> Value {
 
 /// 把扁平 secret 折成会话，再派生 growth 上下文。
 fn growth_account_of(record: &Value) -> Result<GrowthAccount, GatewayError> {
-    let session = super::session_of_record(record, Region::Cn);
+    let mut session = super::session_of_record(record, Region::Cn);
+    if let Some(proxy) = super::contract::proxy_of(record)? { session["proxy"] = json!(proxy); }
     GrowthAccount::from_session(&session).ok_or_else(|| {
         GatewayError::with_status(400, "账号没有可用凭证，请先刷新登录态")
     })

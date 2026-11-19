@@ -33,6 +33,7 @@ use serde_json::{json, Map, Value};
 use agent2api_provider_sdk::PluginCtx;
 use crate::telemetry::RequestTelemetry;
 use crate::http as egress;
+use crate::http::AccountRequest;
 use agent2api_provider_protocol::WireProxy as ResolvedProxy;
 
 use crate::errors::GatewayError;
@@ -47,6 +48,8 @@ use super::stream;
 
 /// 一次转发所需的全部素材（进函数时组装好，之后只读）
 pub struct ChatPlan {
+    /// 本次请求的站点（错误文案与排障日志用它区分产品）
+    pub site: super::endpoints::Site,
     pub url: String,
     pub headers: Vec<(String, String)>,
     /// 已编码的请求体（签名覆盖的就是它）
@@ -143,9 +146,10 @@ pub fn build_plan(
     body: &Value,
     model_name: &str,
 ) -> Result<ChatPlan, GatewayError> {
-    let model = super::models::resolve(model_name, credentials.region).ok_or_else(|| {
+    let model = super::models::resolve(model_name, credentials.site).ok_or_else(|| {
         GatewayError::with_status(400, format!(
-            "模型不存在: {model_name}。Qoder 可用模型见 GET /v1/models"
+            "模型不存在: {model_name}。{} 可用模型见 GET /v1/models",
+            credentials.site.product()
         ))
         .with_code("model_not_found")
     })?;
@@ -155,7 +159,10 @@ pub fn build_plan(
         .unwrap_or("")
         .to_string();
     if upstream_key.is_empty() {
-        return Err(GatewayError::with_status(502, "Qoder 模型目录缺少上游标识"));
+        return Err(GatewayError::with_status(
+            502,
+            format!("{} 模型目录缺少上游标识", credentials.site.product()),
+        ));
     }
     let model_config = model.get("config").cloned().unwrap_or(Value::Null);
 
@@ -214,6 +221,7 @@ pub fn build_plan(
         &thinking,
         &credentials.user_id,
         session_seed,
+        credentials.site,
     );
 
     // ── 上下文档位：装了才升级 ────────────────────────────────
@@ -231,7 +239,7 @@ pub fn build_plan(
         "{}algo/api/v2/service/pro/sse/agent_chat_generation\
          ?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
         // 对话链路按令牌前缀选主机（作业令牌 jt- 走 api2，见 `inference_base`）
-        credentials.region.inference_base(&credentials.access_token)
+        credentials.site.inference_base(&credentials.access_token)
     );
     let identity = CosyIdentity {
         user_id: &credentials.user_id,
@@ -240,7 +248,7 @@ pub fn build_plan(
         email: &credentials.email,
         machine_id: &credentials.machine_id,
     };
-    let mut headers = cosy::build_auth_headers(Some(&encoded), &url, &identity)?;
+    let mut headers = cosy::build_auth_headers(Some(&encoded), &url, &identity, credentials.site)?;
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
     headers.push(("Accept".to_string(), "text/event-stream".to_string()));
     headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
@@ -257,6 +265,7 @@ pub fn build_plan(
     headers.push(("X-Model-Source".to_string(), model_source));
 
     Ok(ChatPlan {
+        site: credentials.site,
         url,
         headers,
         body: encoded,
@@ -277,7 +286,7 @@ pub async fn send(
     plan: &ChatPlan,
     proxy: Option<&ResolvedProxy>,
 ) -> Result<reqwest::Response, GatewayError> {
-    let client = egress::client(proxy, "direct");
+    let client = egress::stream_client(proxy, "direct");
     let mut builder = client.post(&plan.url).body(plan.body.clone());
     for (key, value) in &plan.headers {
         builder = builder.header(key, value);
@@ -291,7 +300,7 @@ pub async fn send(
     let budget = std::time::Duration::from_millis(
         crate::timeouts::current().headers_ms(),
     );
-    match tokio::time::timeout(budget, builder.send()).await {
+    match tokio::time::timeout(budget, builder.with_account_user_agent().send()).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) if error.is_timeout() => {
             // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管）：
@@ -299,18 +308,27 @@ pub async fn send(
             Err(GatewayError::with_status(
                 502,
                 format!(
-                    "Qoder 连接中超时({}秒，出口 {via})",
+                    "{} 连接中超时({}秒，出口 {via})",
+                    plan.site.product(),
                     crate::timeouts::current().connect_ms() / 1000
                 ),
             ))
         }
         Ok(Err(error)) => Err(GatewayError::with_status(
             502,
-            format!("Qoder 上游请求失败（{via}）: {}", egress::describe_chain(&error)),
+            format!(
+                "{} 上游请求失败（{via}）: {}",
+                plan.site.product(),
+                egress::describe_chain(&error)
+            ),
         )),
         Err(_elapsed) => Err(GatewayError::with_status(
             502,
-            format!("Qoder 等待响应超时({}秒，出口 {via})", budget.as_secs()),
+            format!(
+                "{} 等待响应超时({}秒，出口 {via})",
+                plan.site.product(),
+                budget.as_secs()
+            ),
         )),
     }
 }
@@ -436,11 +454,7 @@ impl Translator {
     /// 只有当客户端写的是**内部 key**（`qfmodel` 这类认不出来的名字）时才保留
     /// 映射：那种情况的映射是在把它归一成可读的模型名，是需要的。
     pub fn new(response_id: String, model_name: String, thinking_enabled: bool) -> Self {
-        let echo_requested_model = super::models::resolve(
-            &model_name,
-            super::endpoints::Region::Global,
-        )
-        .is_some();
+        let echo_requested_model = super::models::resolve_any_site(&model_name).is_some();
         Self {
             response_id,
             created: logging::now_ms() / 1000,
@@ -815,16 +829,16 @@ pub struct AccountContext {
     pub proxy: Option<ResolvedProxy>,
 }
 
-/// 取某账号的凭证快照（含临期主动刷新）。`region` 是本适配器的地区身份
+/// 取某账号的凭证快照（含临期主动刷新）。`site` 是本适配器的地区身份
 /// （拆家后 provider 即地区，见 `qoder::mod` 的模块头）。
 pub async fn account_context(
     ctx: &PluginCtx,
-    region: super::endpoints::Region,
+    site: super::endpoints::Site,
     account_id: &str,
     force_refresh: bool,
 ) -> Result<AccountContext, GatewayError> {
-    let credentials = super::refresh::ensure_fresh(ctx, region, account_id, force_refresh).await?;
-    let (record, _) = super::refresh::snapshot(ctx, region, account_id).await?;
+    let credentials = super::refresh::ensure_fresh(ctx, site, account_id, force_refresh).await?;
+    let (record, _) = super::refresh::snapshot(ctx, site, account_id).await?;
     let proxy = super::auth::account_proxy(&record)?;
     Ok(AccountContext { credentials, proxy })
 }

@@ -49,6 +49,20 @@ pub fn split_local_precondition(message: &str) -> Option<&str> {
     message.strip_prefix(LOCAL_PRECONDITION_PREFIX)
 }
 
+/// `String` 错误通道里的能力缺失标记；SDK 将它还原为 `WireError::UNSUPPORTED`。
+pub const UNSUPPORTED_PREFIX: &str = "UNSUPPORTED:";
+
+pub fn unsupported(message: impl AsRef<str>) -> String {
+    format!("{UNSUPPORTED_PREFIX}{}", message.as_ref())
+}
+
+pub fn split_unsupported(message: &str) -> Option<&str> {
+    message.strip_prefix(UNSUPPORTED_PREFIX)
+}
+
+/// 可选扩展：旧 SDK 对该方法返回 `NO_METHOD`，不影响既有握手。
+pub const SCHEDULES_LIST_METHOD: &str = "schedules.list";
+
 /// 异步返回的简写。
 pub type SendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
@@ -237,6 +251,12 @@ impl<'a> ConversationSink<'a> {
         Self { inner }
     }
 
+    /// 当前这条流的只读取消信号；可在等上游响应、子进程或回调时 select。
+    /// 返回独立 Arc，观察取消不需要借用 sink，也不会取消同包其它请求。
+    pub fn cancellation(&self) -> std::sync::Arc<crate::serve::Cancel> {
+        self.inner.cancellation()
+    }
+
     /// 上报上游响应头（**必须**在第一个 chunk 之前调一次）。
     pub async fn head(&mut self, head: proto::StreamHead) -> Result<(), String> {
         self.inner.send_head(head).await
@@ -255,6 +275,11 @@ impl<'a> ConversationSink<'a> {
 
 /// `ConversationSink` 的内部接口（由 `serve()` 实现，作者不该用）。
 pub trait SinkInner: Send {
+    /// 自定义 sink 的默认信号永不触发，保持已有实现的源码兼容。
+    fn cancellation(&self) -> std::sync::Arc<crate::serve::Cancel> {
+        std::sync::Arc::new(crate::serve::Cancel::default())
+    }
+
     fn send_head<'a>(&'a mut self, head: proto::StreamHead) -> SendFuture<'a, ()>;
     fn send_chunk<'a>(&'a mut self, bytes: &'a [u8]) -> SendFuture<'a, ()>;
 }
@@ -268,10 +293,25 @@ pub trait Provider: Send + Sync + 'static {
     /// 这个 provider 的静态描述。
     fn meta(&self) -> ProviderMeta;
 
+    /// 用户选项随插件声明，主程序只保存覆盖值；默认值不得写回用户配置。
+    fn settings_schema(&self) -> Option<crate::settings::Schema> { None }
+
+    /// 可选的分组显示名；共用 storage_provider 的设置必须使用相同的分组声明。
+    fn settings_group(&self) -> Option<crate::settings::Group> { None }
+
+    /// 只返回已声明的非敏感字段，形如 {key: {source, value}}。
+    fn settings_overrides(&self) -> Value { serde_json::json!({}) }
+
     /// provider id（与 `meta().id` 相同；单独一个方法是为了让路由表能
     /// 在建表时不必构造整个 `ProviderMeta`）。
     fn provider_id(&self) -> String {
         self.meta().id
+    }
+
+    /// Optional process-owned cleanup. Existing providers keep their no-op default;
+    /// helper-backed providers await this before the SDK acknowledges shutdown.
+    fn shutdown<'a>(&'a self) -> SendFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     // ── 数据面 ────────────────────────────────────────────────
@@ -288,6 +328,34 @@ pub trait Provider: Send + Sync + 'static {
     ) -> SendFuture<'a, ChatPlan> {
         Box::pin(async {
             Err(format!("{} 没有实现无状态转发（build_chat）", self.provider_id()))
+        })
+    }
+
+    fn supports_image_generation(&self) -> bool {
+        false
+    }
+
+    fn supports_image_editing(&self) -> bool {
+        false
+    }
+
+    fn build_image_edit<'a>(
+        &'a self,
+        _ctx: &'a crate::ctx::PluginCtx,
+        _req: crate::images::ImageRequest,
+    ) -> SendFuture<'a, crate::images::ImagePlan> {
+        Box::pin(async move {
+            Err(unsupported(format!("{} 尚未接入图片编辑", self.provider_id())))
+        })
+    }
+
+    fn build_image<'a>(
+        &'a self,
+        _ctx: &'a crate::ctx::PluginCtx,
+        _req: crate::images::ImageRequest,
+    ) -> SendFuture<'a, crate::images::ImagePlan> {
+        Box::pin(async move {
+            Err(unsupported(format!("{} 尚未接入图片生成", self.provider_id())))
         })
     }
 
@@ -316,6 +384,16 @@ pub trait Provider: Send + Sync + 'static {
         }
     }
 
+    /// 可选传输与响应策略；未声明时沿用原有单次发送。
+    fn chat_policy(&self, _body: &Value) -> Value {
+        Value::Null
+    }
+
+    /// 分类之外的处置约束，不新增 ErrorClass 变体。
+    fn error_policy(&self, _status: u16, _body: &Value) -> Value {
+        Value::Null
+    }
+
     /// 上游响应是否「其实是错误」（HTTP 200 但正文是失败话术）。
     fn is_error_response(&self, _status: u16, _headers: &BTreeMap<String, String>) -> bool {
         false
@@ -326,14 +404,47 @@ pub trait Provider: Send + Sync + 'static {
         (Vec::new(), Vec::new())
     }
 
-    /// 可退避重试的建议。
+    /// 可退避重试的建议；None 表示没有专属建议，允许网关使用通用规则。
     fn retry_advice(&self, _body: &Value, _attempt: usize, _budget: usize) -> Option<proto::RetryAdvice> {
         None
+    }
+
+    /// 可选的重试决定；Stop 终止本次请求，不再重发或换账号。
+    fn retry_decision(
+        &self,
+        _status: u16,
+        body: &Value,
+        attempt: usize,
+        budget: usize,
+    ) -> crate::retry::RetryDecision {
+        match self.retry_advice(body, attempt, budget) {
+            Some(advice) => crate::retry::RetryDecision::Retry {
+                delay_ms: advice.delay_ms,
+                reason: advice.reason,
+            },
+            None => crate::retry::RetryDecision::Default,
+        }
     }
 
     /// 思考档位翻译（默认不注入）。
     fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value) -> proto::ReasoningPatch {
         proto::ReasoningPatch::Skip { reason: "该提供商不支持思考等级".to_string() }
+    }
+
+    /// 需要宿主目录缓存的实现可在异步入口恢复目录；旧实现仍走同步翻译。
+    fn reasoning_patch_async<'a>(
+        &'a self,
+        _ctx: &'a crate::ctx::PluginCtx,
+        level: &'a str,
+        model: &'a str,
+        body: &'a Value,
+    ) -> SendFuture<'a, proto::ReasoningPatch> {
+        Box::pin(async move { Ok(self.reasoning_patch(level, model, body)) })
+    }
+
+    /// 最外层 None 表示未提供遥测；Some(None) 明确表示本次没有思考档位。
+    fn outbound_reasoning(&self, _body: &Value) -> Option<Option<String>> {
+        None
     }
 
     /// 限额冷却的连带模型（默认只有请求的那个）。
@@ -404,7 +515,28 @@ pub trait Provider: Send + Sync + 'static {
         Box::pin(async { Ok(proto::RefreshOutcome::unchanged()) })
     }
 
+    /// 可选的同次刷新快照信封；旧 provider 仍返回原 RefreshOutcome。
+    /// helper-backed provider 可以避免宿主紧接 models.list 再出一次网。
+    fn refresh_models_snapshot<'a>(
+        &'a self,
+        ctx: &'a crate::ctx::PluginCtx,
+        account: &'a str,
+        force: bool,
+    ) -> SendFuture<'a, Value> {
+        Box::pin(async move {
+            serde_json::to_value(self.refresh_models(ctx, account, force).await?)
+                .map_err(|_| "刷新结果无法序列化".to_string())
+        })
+    }
+
     // ── 余额 / 签到 / 领取 ─────────────────────────────────────
+
+    /// 定时管理动作的申报：`[{id, enabled, times, action}]`。
+    ///
+    /// 默认值由插件提供，用户开关、时刻与执行记录由宿主持久化；未申报不调度。
+    fn schedules(&self) -> Vec<Value> {
+        Vec::new()
+    }
 
     /// 余额 / 积分查询。
     fn usage<'a>(
@@ -415,6 +547,11 @@ pub trait Provider: Send + Sync + 'static {
         Box::pin(async { Err("该提供商没有实现余额查询".to_string()) })
     }
 
+    /// 额度来源声明：只返回可核实的上游读数，旧宿主会忽略新增 JSON 字段。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        report.get("quotaSources").and_then(Value::as_array).cloned().unwrap_or_default()
+    }
+
     /// 每日签到。
     fn checkin<'a>(
         &'a self,
@@ -422,6 +559,16 @@ pub trait Provider: Send + Sync + 'static {
         _account: &'a str,
     ) -> SendFuture<'a, proto::CheckinReport> {
         Box::pin(async { Err("该提供商没有实现签到".to_string()) })
+    }
+
+    /// 旧宿主未传 manual 时按自动签到处理，保留各家的无人值守写请求限制。
+    fn checkin_with_options<'a>(
+        &'a self,
+        ctx: &'a crate::ctx::PluginCtx,
+        account: &'a str,
+        _manual: bool,
+    ) -> SendFuture<'a, crate::CheckinResult> {
+        Box::pin(async move { self.checkin(ctx, account).await.map(Into::into) })
     }
 
     /// 领取类活动。
@@ -467,8 +614,17 @@ pub trait Provider: Send + Sync + 'static {
         _payload: &'a Value,
     ) -> SendFuture<'a, Value> {
         Box::pin(async move {
-            Err(format!("该提供商没有实现管理动作「{action}」"))
+            Err(unsupported(format!("该提供商没有实现管理动作「{action}」")))
         })
+    }
+
+    fn native_helpers(&self) -> Vec<Value> { Vec::new() }
+
+    fn native_call<'a>(
+        &'a self, _ctx: &'a crate::ctx::PluginCtx, _caller: &'a str,
+        _helper: &'a str, _operation: &'a str, _payload: &'a Value,
+    ) -> SendFuture<'a, Value> {
+        Box::pin(async { Err(unsupported("该插件没有实现原生辅助能力")) })
     }
 
     // ── 账号 ──────────────────────────────────────────────────
@@ -520,6 +676,15 @@ pub trait Provider: Send + Sync + 'static {
         _callback: proto::LoginCallback,
     ) -> SendFuture<'a, proto::LoginPoll> {
         Box::pin(async { Err("该提供商没有实现登录回调".to_string()) })
+    }
+
+    /// 回填结果可带下一步授权地址；旧实现仍按 LoginPoll 返回。
+    fn login_callback_result<'a>(
+        &'a self,
+        ctx: &'a crate::ctx::PluginCtx,
+        callback: proto::LoginCallback,
+    ) -> SendFuture<'a, crate::LoginCallbackResult> {
+        Box::pin(async move { self.login_callback(ctx, callback).await.map(Into::into) })
     }
 
     /// 取消一次登录流程。

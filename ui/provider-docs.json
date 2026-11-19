@@ -1,0 +1,328 @@
+{
+  "schema": 1,
+  "description": {
+    "zh-CN": "提供商实现由本插件提供。具体支持情况随插件版本更新，国内版、国际版和额度池分别列出。手动回调按网关声明的 callbackInput 原样提交 URL 或隐藏的 code；旧网关未声明时不猜输入。回调接收不算完成，仍等待网关终态。API 添加仅在 proxySaved:true 时跳过第二次代理保存，旧网关兼容保存仍提示核查；失败不撤销已加账号。",
+    "zh-Hant": "提供商實作由本外掛提供。具體支援情況隨外掛版本更新，國內版、國際版和額度池分別列出。手動回呼依閘道宣告的 callbackInput 原樣提交 URL 或隱藏的 code；舊閘道未宣告時不猜測輸入。回呼接收不算完成，仍等待閘道終態。API 新增僅在 proxySaved:true 時略過第二次代理儲存，舊閘道相容儲存仍提示核查；失敗不撤銷已新增帳號。",
+    "en": "Provider integrations are supplied by this plugin. Capabilities follow the installed plugin version; regions and quota pools are listed separately. Manual callbacks submit an unchanged URL or hidden code according to the gateway's callbackInput; undeclared inputs are not guessed. Callback acceptance is not completion; the gateway's terminal result is still required. API creation skips a second proxy save only for proxySaved:true; older gateways retain a compatibility-save warning. Failure does not remove an added account.",
+    "ja": "プロバイダー連携はこのプラグインが提供します。対応状況はインストール済みのバージョンに従い、地域とクォータプールを個別に表示します。手動コールバックはゲートウェイの callbackInput に従い、URL または非表示の code を変更せず送信します。未宣言の入力は推測しません。受信だけでは完了とせず、ゲートウェイの終端結果を待ちます。API 追加時は proxySaved:true の場合のみ 2 回目のプロキシ保存を省略し、旧ゲートウェイの互換保存では確認警告を残します。失敗しても追加済みアカウントは削除しません。",
+    "ko": "제공업체 연동은 이 플러그인이 제공합니다. 기능은 설치된 플러그인 버전을 따르며 지역과 할당량 풀을 별도로 표시합니다. 수동 콜백은 게이트웨이의 callbackInput에 따라 URL 또는 숨겨진 code를 변경 없이 제출하고 미선언 입력은 추측하지 않습니다. 수신만으로 완료되지 않으며 게이트웨이의 최종 결과를 기다립니다. API 추가 시 proxySaved:true인 경우에만 두 번째 프록시 저장을 생략하며 이전 게이트웨이의 호환 저장에는 확인 경고를 남깁니다. 실패해도 추가된 계정을 삭제하지 않습니다.",
+    "pt-BR": "As integrações são fornecidas por este plugin. As capacidades acompanham a versão instalada; regiões e pools de cota são listados separadamente. Callbacks manuais enviam a URL original ou code oculto conforme callbackInput do gateway; entradas não declaradas não são deduzidas. O recebimento não conclui o login; ainda se aguarda o resultado final do gateway. A criação por API só omite a segunda gravação do proxy com proxySaved:true; gateways antigos mantêm um aviso da gravação de compatibilidade. Falhas não removem contas já adicionadas."
+  },
+  "providers": {
+    "demo": { "hidden": true },
+    "commandcode": {
+      "capabilities": {
+        "refresh": { "status": "not_applicable" },
+        "usage": { "status": "undeclared" },
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "使用静态 API Key，没有 Token 续期概念。当前未提供余额读数。",
+        "zh-Hant": "使用靜態 API Key，沒有 Token 續期概念。目前未提供餘額讀數。",
+        "en": "Uses a static API Key, so token renewal does not apply. Balance readings are not currently provided.",
+        "ja": "固定の API Key を使用するため、トークン更新は対象外です。残高データは現在提供されていません。",
+        "ko": "고정 API Key를 사용하므로 토큰 갱신은 해당하지 않습니다. 현재 잔액 데이터는 제공하지 않습니다.",
+        "pt-BR": "Usa uma API Key estática; a renovação de token não se aplica. Leituras de saldo não são fornecidas atualmente."
+      }]
+    },
+    "modelscope": {
+      "capabilities": {
+        "refresh": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "已接入官方异步 Images 接口：Qwen-Image / Z-Image 文生图、Qwen-Image-Edit 参考图编辑，仅限当前目录中已确认的型号。单次 n=1，编辑接受 1–3 张参考图；创建后只查询原任务，不重新提交。未使用真实账号验证，具体可用型号和额度以账号为准。",
+        "zh-Hant": "已接入官方非同步 Images 介面：Qwen-Image / Z-Image 文字生圖、Qwen-Image-Edit 參考圖編輯，僅限目前目錄中已確認的型號。單次 n=1，編輯接受 1–3 張參考圖；建立後只查詢原任務，不重新提交。尚未以真實帳號驗證，可用型號與額度以帳號為準。",
+        "en": "Implements the official asynchronous Images API for confirmed catalog models: Qwen-Image / Z-Image generation and Qwen-Image-Edit reference editing. Uses n=1 and 1–3 references; polls the original task without resubmitting. Not validated with a real account; model availability and quota depend on the account.",
+        "ja": "公式の非同期 Images API を実装しています。確認済みの一覧モデルに限り、Qwen-Image / Z-Image の画像生成と Qwen-Image-Edit の参照画像編集に対応します。n=1、参照画像は 1–3 枚で、元のタスクのみを照会し再送信しません。実アカウントでは未検証で、利用可能なモデルとクォータはアカウントによります。",
+        "ko": "확인된 목록 모델에 공식 비동기 Images API를 구현했습니다. Qwen-Image / Z-Image 생성과 Qwen-Image-Edit 참조 편집을 지원합니다. n=1, 참조 이미지 1–3장으로 원래 작업만 조회하고 다시 제출하지 않습니다. 실제 계정으로 검증하지 않았으며 사용 가능한 모델과 할당량은 계정에 따라 다릅니다.",
+        "pt-BR": "Implementa a API Images assíncrona oficial para modelos confirmados no catálogo: geração Qwen-Image / Z-Image e edição Qwen-Image-Edit. Usa n=1 e 1–3 referências; consulta a tarefa original sem reenviar. Não validado com conta real; modelos disponíveis e cota dependem da conta."
+      }]
+    },
+    "modelscope-intl": {
+      "capabilities": {
+        "refresh": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "国际版使用独立账号与模型目录；图片调用复用官方异步 Images 协议，只开放目录中已确认的 Qwen-Image / Z-Image / Qwen-Image-Edit 型号。单次 n=1，编辑接受 1–3 张参考图。未使用国际版真实账号验证，不保证与国内版拥有相同型号和额度。",
+        "zh-Hant": "國際版使用獨立帳號與模型目錄；圖片呼叫共用官方非同步 Images 協定，只開放目錄中已確認的 Qwen-Image / Z-Image / Qwen-Image-Edit 型號。單次 n=1，編輯接受 1–3 張參考圖。尚未以國際版真實帳號驗證，不保證與國內版擁有相同型號和額度。",
+        "en": "The international region has separate accounts and catalogs. Images use the official asynchronous protocol only for confirmed Qwen-Image / Z-Image / Qwen-Image-Edit models. Uses n=1 and 1–3 references. Not validated with an international account; models and quota may differ from the domestic region.",
+        "ja": "国際版は別のアカウントとモデル一覧を使用します。確認済みの Qwen-Image / Z-Image / Qwen-Image-Edit にのみ公式の非同期 Images プロトコルを使用します。n=1、参照画像は 1–3 枚です。国際版の実アカウントでは未検証で、国内版とモデルやクォータが同じとは限りません。",
+        "ko": "국제 지역은 별도 계정과 모델 목록을 사용합니다. 확인된 Qwen-Image / Z-Image / Qwen-Image-Edit 모델에만 공식 비동기 Images 프로토콜을 사용합니다. n=1, 참조 이미지 1–3장입니다. 국제 계정으로 검증하지 않았으며 중국 지역과 모델 및 할당량이 같다고 보장하지 않습니다.",
+        "pt-BR": "A região internacional tem contas e catálogo separados. Usa o protocolo Images assíncrono oficial apenas para modelos Qwen-Image / Z-Image / Qwen-Image-Edit confirmados, com n=1 e 1–3 referências. Não validado com conta internacional; modelos e cota podem diferir da região chinesa."
+      }]
+    },
+    "orcaterm": {
+      "capabilities": {
+        "model_refresh": { "status": "unsupported" },
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "模型目录来自客户端静态清单；在线目录接口对普通账号返回空表。",
+        "zh-Hant": "模型目錄來自用戶端靜態清單；線上目錄介面對一般帳號回傳空表。",
+        "en": "The model catalog comes from the client's static list; the online catalog endpoint returns an empty list for regular accounts.",
+        "ja": "モデル一覧はクライアントの固定リストです。オンライン一覧 API は一般アカウントに空のリストを返します。",
+        "ko": "모델 목록은 클라이언트의 정적 목록을 사용합니다. 온라인 목록 API는 일반 계정에 빈 목록을 반환합니다.",
+        "pt-BR": "O catálogo usa a lista estática do cliente; o endpoint online retorna uma lista vazia para contas comuns."
+      }]
+    },
+    "loomy": {
+      "capabilities": { "refresh": { "status": "unsupported" } },
+      "notes": [{
+        "zh-CN": "没有可用的凭证续期接口；凭证失效后需重新登录，不根据估算时间判定过期。",
+        "zh-Hant": "沒有可用的憑證續期介面；憑證失效後需重新登入，不根據估算時間判定過期。",
+        "en": "No credential renewal endpoint is available. Sign in again when credentials become invalid; expiry is not inferred from an estimated lifetime.",
+        "ja": "認証情報の更新 API はありません。無効になった場合は再ログインが必要です。有効期限は推定しません。",
+        "ko": "인증 정보 갱신 API가 없습니다. 인증 정보가 무효화되면 다시 로그인해야 하며 추정 수명으로 만료를 판단하지 않습니다.",
+        "pt-BR": "Não há endpoint de renovação de credenciais. Entre novamente quando forem invalidadas; a validade não é inferida por estimativa."
+      }]
+    },
+    "lobsterai": {
+      "capabilities": { "claims": { "status": "not_applicable" } }
+    },
+    "atomcode": {
+      "capabilities": { "claims": { "status": "supported" } },
+      "notes": [{
+        "zh-CN": "签到链按需领取免费 CodingPlan；已有有效套餐时仅回读额度，不重复领取。",
+        "zh-Hant": "簽到鏈按需領取免費 CodingPlan；已有有效套餐時僅讀回額度，不重複領取。",
+        "en": "The check-in workflow claims a free CodingPlan only when needed. With a valid plan, it reads the quota without claiming again.",
+        "ja": "チェックイン処理は必要時のみ無料 CodingPlan を取得します。有効なプランがある場合はクォータの確認のみ行います。",
+        "ko": "체크인 과정은 필요할 때만 무료 CodingPlan을 받습니다. 유효한 요금제가 있으면 중복 수령 없이 할당량만 확인합니다.",
+        "pt-BR": "O fluxo de check-in resgata um CodingPlan gratuito apenas quando necessário. Com um plano válido, consulta a cota sem resgatar novamente."
+      }]
+    },
+    "autoclaw": {
+      "capabilities": { "claims": { "status": "not_applicable" } }
+    },
+    "autoclaw-intl": {
+      "capabilities": { "claims": { "status": "not_applicable" } }
+    },
+    "zcode": {
+      "capabilities": {
+        "refresh": { "status": "unsupported" },
+        "model_refresh": { "status": "unsupported" },
+        "checkin": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "仅有静态模型清单，没有凭证续期接口。活动套餐领取与每日签到是不同能力。",
+        "zh-Hant": "僅有靜態模型清單，沒有憑證續期介面。活動套餐領取與每日簽到是不同能力。",
+        "en": "Only a static model list is available, with no credential renewal endpoint. Promotional plan claims are separate from daily check-in.",
+        "ja": "モデル一覧は固定で、認証情報の更新 API はありません。キャンペーンプランの取得は毎日のチェックインとは別機能です。",
+        "ko": "정적 모델 목록만 있으며 인증 정보 갱신 API가 없습니다. 이벤트 요금제 수령은 일일 체크인과 별개 기능입니다.",
+        "pt-BR": "Há apenas uma lista estática de modelos, sem endpoint de renovação de credenciais. Resgates de planos promocionais são separados do check-in diário."
+      }]
+    },
+    "zcode-intl": {
+      "capabilities": {
+        "refresh": { "status": "unsupported" },
+        "model_refresh": { "status": "unsupported" },
+        "checkin": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "仅有静态模型清单，没有凭证续期接口。活动套餐领取与每日签到是不同能力。",
+        "zh-Hant": "僅有靜態模型清單，沒有憑證續期介面。活動套餐領取與每日簽到是不同能力。",
+        "en": "Only a static model list is available, with no credential renewal endpoint. Promotional plan claims are separate from daily check-in.",
+        "ja": "モデル一覧は固定で、認証情報の更新 API はありません。キャンペーンプランの取得は毎日のチェックインとは別機能です。",
+        "ko": "정적 모델 목록만 있으며 인증 정보 갱신 API가 없습니다. 이벤트 요금제 수령은 일일 체크인과 별개 기능입니다.",
+        "pt-BR": "Há apenas uma lista estática de modelos, sem endpoint de renovação de credenciais. Resgates de planos promocionais são separados do check-in diário."
+      }]
+    },
+    "raccoon": {
+      "capabilities": { "claims": { "status": "supported" } },
+      "notes": [{
+        "zh-CN": "已对齐官方客户端 1.1.5。旧凭证可续期；IAM 没有刷新接口，过期后需重新登录。本机导入自动识别新旧目录。模型、积分与图片请求使用相同组织身份；每日积分按 v2 账单核对，首次登录奖励单独领取。参考图编辑需要支持 multipart 的新版网关；图片操作单次 n=1。本次未运行对话、图片或领取测试。",
+        "zh-Hant": "已對齊官方用戶端 1.1.5。舊憑證可續期；IAM 沒有更新介面，過期後需重新登入。本機匯入自動識別新舊目錄。模型、積分與圖片請求使用相同組織身分；每日積分依 v2 帳單核對，首次登入獎勵獨立領取。參考圖編輯需要支援 multipart 的新版閘道；圖片操作單次 n=1。本次未執行對話、圖片或領取測試。",
+        "en": "Aligned with official client 1.1.5. Legacy credentials can refresh; IAM has no refresh grant and requires sign-in after expiry. Desktop import detects old and new profiles. Model, points and image requests share the account organization. Daily grants are checked against v2 bills; first-login rewards are separate. Reference editing requires a gateway with multipart support; images use n=1. Chat, image and claim tests were not run.",
+        "ja": "公式クライアント 1.1.5 に対応しています。旧認証情報は更新できますが、IAM は更新 API がなく、期限切れ後に再ログインが必要です。ローカル取り込みは新旧の保存先を識別します。モデル、ポイント、画像の要求は同じ組織を使用します。日次ポイントは v2 明細で確認し、初回ログイン報酬は個別に取得します。参照画像編集には multipart 対応ゲートウェイが必要で、画像は n=1 です。対話、画像、報酬のテストは未実行です。",
+        "ko": "공식 클라이언트 1.1.5에 맞췄습니다. 기존 인증 정보는 갱신할 수 있지만 IAM에는 갱신 API가 없어 만료 후 다시 로그인해야 합니다. 로컬 가져오기는 새 경로와 기존 경로를 구분합니다. 모델, 포인트, 이미지 요청에 같은 조직 정보를 사용합니다. 일일 포인트는 v2 내역으로 확인하며 첫 로그인 보상은 별도로 수령합니다. 참조 편집에는 multipart 지원 게이트웨이가 필요하고 이미지 요청은 n=1입니다. 대화, 이미지 및 수령 테스트는 실행하지 않았습니다.",
+        "pt-BR": "Alinhado ao cliente oficial 1.1.5. Credenciais antigas podem ser renovadas; IAM não tem concessão de renovação e exige novo login após expirar. A importação detecta perfis antigos e novos. Pedidos de modelos, pontos e imagens usam a mesma organização. Créditos diários são conferidos nas faturas v2; recompensas do primeiro login são separadas. A edição de referência exige gateway com multipart; imagens usam n=1. Testes de chat, imagens e resgates não foram executados."
+      }]
+    },
+    "workbuddy": {
+      "notes": [{
+        "zh-CN": "已接入官方图片接口（/v2/images/generations 与 /v2/images/edits）：目录中带 text-to-image 标签的模型文生图，带 image-to-image 标签的模型做参考图编辑。参考图以 data URL 内联在 JSON 里发送（不是 multipart），最多 16 张；size 省略或 auto 时按 1024x1024 请求，不接受 quality、style、background 与 moderation，请把要求写进 prompt。",
+        "zh-Hant": "已接入官方圖片介面（/v2/images/generations 與 /v2/images/edits）：目錄中帶 text-to-image 標籤的模型做文字生圖，帶 image-to-image 標籤的模型做參考圖編輯。參考圖以 data URL 內聯在 JSON 裡傳送（不是 multipart），最多 16 張；size 省略或 auto 時按 1024x1024 請求，不接受 quality、style、background 與 moderation，請把要求寫進 prompt。",
+        "en": "The official image API is integrated (/v2/images/generations and /v2/images/edits): models tagged text-to-image generate images, and models tagged image-to-image edit reference images. Reference images are sent inline as data URLs inside JSON (not multipart), up to 16; an omitted or auto size is requested as 1024x1024, and quality, style, background and moderation are not accepted — describe them in the prompt instead.",
+        "ja": "公式の画像 API（/v2/images/generations と /v2/images/edits）に対応しました。カタログで text-to-image タグが付いたモデルは画像生成、image-to-image タグのモデルは参照画像編集を行います。参照画像は data URL として JSON にインラインで送信され（multipart ではありません）、最大 16 枚です。size を省略または auto にすると 1024x1024 で要求し、quality、style、background、moderation は受け付けないため、指定は prompt に書いてください。",
+        "ko": "공식 이미지 API(/v2/images/generations 및 /v2/images/edits)를 지원합니다. 카탈로그에서 text-to-image 태그가 붙은 모델은 이미지 생성, image-to-image 태그 모델은 참조 이미지 편집을 수행합니다. 참조 이미지는 data URL로 JSON에 인라인 전송되며(multipart 아님) 최대 16장입니다. size를 생략하거나 auto로 하면 1024x1024로 요청하고 quality, style, background, moderation은 받지 않으므로 요구 사항은 prompt에 적어 주세요.",
+        "pt-BR": "A API oficial de imagens está integrada (/v2/images/generations e /v2/images/edits): modelos com a tag text-to-image geram imagens e modelos com a tag image-to-image editam imagens de referência. As imagens de referência vão embutidas como data URLs no JSON (não multipart), até 16; size omitido ou auto é solicitado como 1024x1024, e quality, style, background e moderation não são aceitos — descreva-os no prompt."
+      }]
+    },
+    "workbuddy-intl": {
+      "notes": [{
+        "zh-CN": "每日活跃任务包含网页会话保活与领取积分，可分别执行；不是国内版的普通签到接口。",
+        "zh-Hant": "每日活躍任務包含網頁工作階段保活與領取積分，可分別執行；不是國內版的一般簽到介面。",
+        "en": "Daily activity combines web-session keepalive and point claims, which can run separately. It is not the domestic version's standard check-in endpoint.",
+        "ja": "毎日のアクティビティは Web セッション維持とポイント取得を個別に実行できます。国内版の通常チェックインとは異なります。",
+        "ko": "일일 활동은 웹 세션 유지와 포인트 수령을 각각 실행할 수 있습니다. 중국 내 버전의 일반 체크인 API와는 다릅니다.",
+        "pt-BR": "A atividade diária combina manutenção da sessão web e resgate de pontos, executáveis separadamente. Não é o endpoint de check-in padrão da versão chinesa."
+      }]
+    },
+    "cline-free": {
+      "capabilities": {
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "cline-pass": {
+      "capabilities": {
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "kuku": {
+      "capabilities": {
+        "refresh": { "status": "unsupported" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "monkeycode": {
+      "capabilities": { "refresh": { "status": "unsupported" } },
+      "notes": [{
+        "zh-CN": "会话没有续期接口。余额、签到和领取尚未确认可用，未开启能力位不代表已确认上游不存在。",
+        "zh-Hant": "工作階段沒有續期介面。餘額、簽到和領取尚未確認可用，未開啟能力位不代表已確認上游不存在。",
+        "en": "Sessions have no renewal endpoint. Balance, check-in and rewards are not confirmed available; disabled capability flags do not prove their absence upstream.",
+        "ja": "セッション更新 API はありません。残高、チェックイン、報酬は利用可能と確認されていません。無効な機能フラグは上流での不在を意味しません。",
+        "ko": "세션 갱신 API가 없습니다. 잔액, 체크인, 보상의 사용 가능 여부는 확인되지 않았으며 비활성 기능 플래그가 상위 서비스의 부재를 뜻하지는 않습니다.",
+        "pt-BR": "As sessões não têm endpoint de renovação. Saldo, check-in e recompensas não foram confirmados; flags desativadas não comprovam ausência no serviço upstream."
+      }]
+    },
+    "monkeycode-intl": {
+      "capabilities": { "refresh": { "status": "unsupported" } },
+      "notes": [{
+        "zh-CN": "会话没有续期接口。余额、签到和领取尚未确认可用，未开启能力位不代表已确认上游不存在。",
+        "zh-Hant": "工作階段沒有續期介面。餘額、簽到和領取尚未確認可用，未開啟能力位不代表已確認上游不存在。",
+        "en": "Sessions have no renewal endpoint. Balance, check-in and rewards are not confirmed available; disabled capability flags do not prove their absence upstream.",
+        "ja": "セッション更新 API はありません。残高、チェックイン、報酬は利用可能と確認されていません。無効な機能フラグは上流での不在を意味しません。",
+        "ko": "세션 갱신 API가 없습니다. 잔액, 체크인, 보상의 사용 가능 여부는 확인되지 않았으며 비활성 기능 플래그가 상위 서비스의 부재를 뜻하지는 않습니다.",
+        "pt-BR": "As sessões não têm endpoint de renovação. Saldo, check-in e recompensas não foram confirmados; flags desativadas não comprovam ausência no serviço upstream."
+      }]
+    },
+    "qoder": {
+      "capabilities": { "claims": { "status": "not_applicable" } },
+      "notes": [{
+        "zh-CN": "每日签到通过活动领取完成，活动窗口每天 10:00（UTC+8）刷新。",
+        "zh-Hant": "每日簽到透過活動領取完成，活動時段每天 10:00（UTC+8）更新。",
+        "en": "Daily check-in uses campaign claims; the campaign window refreshes at 10:00 (UTC+8).",
+        "ja": "毎日のチェックインはキャンペーン取得で行い、毎日 10:00（UTC+8）に更新されます。",
+        "ko": "일일 체크인은 캠페인 수령으로 처리하며 매일 10:00(UTC+8)에 갱신됩니다.",
+        "pt-BR": "O check-in diário usa resgates de campanha; a janela é renovada às 10:00 (UTC+8)."
+      }]
+    },
+    "qoder-intl": {
+      "capabilities": { "claims": { "status": "not_applicable" } },
+      "notes": [{
+        "zh-CN": "每日奖励领取需要 UMID 设备风控组件，按账号状态和上游活动规则执行。",
+        "zh-Hant": "每日獎勵領取需要 UMID 裝置風控元件，依帳號狀態和上游活動規則執行。",
+        "en": "Daily reward claims require the UMID device-risk component and depend on account state and upstream campaign rules.",
+        "ja": "毎日の報酬取得には UMID 端末認証コンポーネントが必要で、アカウント状態と上流のキャンペーン規則に従います。",
+        "ko": "일일 보상 수령에는 UMID 기기 위험 관리 구성 요소가 필요하며 계정 상태와 상위 캠페인 규칙을 따릅니다.",
+        "pt-BR": "Os resgates diários exigem o componente UMID de verificação do dispositivo e dependem da conta e das regras da campanha upstream."
+      }]
+    },
+    "qwenwork": {
+      "capabilities": { "claims": { "status": "not_applicable" } },
+      "notes": [
+      {
+        "zh-CN": "登录走官方设备授权页：在浏览器里登录并授权后，插件轮询收下账号，不需要本机回调。没有个人访问令牌，也没有每日签到与领取类活动。个人账号的额度只有「剩余」，三档积分池（每日 / 每月 / 长期）来自钱包接口。",
+        "zh-Hant": "登入走官方裝置授權頁：在瀏覽器登入並授權後，外掛輪詢收下帳號，不需要本機回呼。沒有個人存取權杖，也沒有每日簽到與領取類活動。個人帳號的額度只有「剩餘」，三檔積分池（每日 / 每月 / 長期）來自錢包介面。",
+        "en": "Sign-in uses the official device-authorization page: after you sign in and approve it in the browser, the plugin polls and adds the account; no local callback is needed. There is no personal access token, and no daily check-in or claimable campaigns. A personal account reports only its remaining quota; the three credit pools (daily / monthly / long-term) come from the wallets endpoint.",
+        "ja": "ログインは公式のデバイス認可ページを使用します。ブラウザでログインして承認すると、プラグインがポーリングしてアカウントを追加します（ローカルコールバックは不要）。個人アクセストークンはなく、毎日のチェックインや受け取り型キャンペーンもありません。個人アカウントの残高は「残り」のみで、3 つのクレジットプール（毎日 / 毎月 / 長期）は wallets エンドポイントから取得します。",
+        "ko": "로그인은 공식 기기 인가 페이지를 사용합니다. 브라우저에서 로그인하고 승인하면 플러그인이 폴링하여 계정을 추가하며, 로컬 콜백이 필요 없습니다. 개인 액세스 토큰이 없고, 일일 체크인과 수령형 캠페인도 없습니다. 개인 계정의 사용량은 남은 양만 제공되며, 세 가지 크레딧 풀(일일 / 월간 / 장기)은 wallets 엔드포인트에서 읽습니다.",
+        "pt-BR": "O login usa a página oficial de autorização de dispositivo: depois de entrar e aprovar no navegador, o plugin consulta e adiciona a conta, sem callback local. Não há token de acesso pessoal, nem check-in diário, nem campanhas resgatáveis. Uma conta pessoal informa apenas o saldo restante; os três pools de créditos (diário / mensal / de longo prazo) vêm do endpoint de carteiras."
+      }
+      ]
+    },
+    "qwenwork-intl": {
+      "capabilities": { "claims": { "status": "not_applicable" } },
+      "notes": [
+      {
+        "zh-CN": "国际版与国内版同一套登录方式（官方设备授权页）。对话、余额与模型目录走 gateway.qwenwork.ai，其余说明同国内版。",
+        "zh-Hant": "國際版與國內版同一套登入方式（官方裝置授權頁）。對話、餘額與模型目錄走 gateway.qwenwork.ai，其餘說明同國內版。",
+        "en": "The international edition signs in the same way as the China edition (the official device-authorization page). Chat, usage and the model catalog go through gateway.qwenwork.ai; the rest matches the China edition.",
+        "ja": "国際版も中国版と同じログイン方法（公式のデバイス認可ページ）です。会話・残高・モデル一覧は gateway.qwenwork.ai を使用し、その他は中国版と同じです。",
+        "ko": "국제판도 중국판과 같은 로그인 방식(공식 기기 인가 페이지)을 사용합니다. 대화, 잔액, 모델 목록은 gateway.qwenwork.ai를 사용하며 나머지는 중국판과 같습니다.",
+        "pt-BR": "A edição internacional entra da mesma forma que a edição da China (a página oficial de autorização de dispositivo). Chat, saldo e catálogo de modelos passam por gateway.qwenwork.ai; o restante é igual à edição da China."
+      }
+      ]
+    },
+    "trae": {
+      "capabilities": { "claims": { "status": "undeclared" } },
+      "notes": [{
+        "zh-CN": "本插件不提供 Trae 活动查询与领取入口；相关活动请在官方客户端处理，每日签到保留。",
+        "zh-Hant": "本外掛不提供 Trae 活動查詢與領取入口；相關活動請在官方用戶端處理，每日簽到保留。",
+        "en": "This plugin does not provide Trae campaign queries or claims. Use the official client for campaigns; daily check-in remains available.",
+        "ja": "このプラグインは Trae のキャンペーン照会・受け取り機能を提供しません。キャンペーンは公式クライアントで操作してください。毎日のチェックインは引き続き利用できます。",
+        "ko": "이 플러그인은 Trae 이벤트 조회 및 수령 기능을 제공하지 않습니다. 이벤트는 공식 클라이언트에서 처리하세요. 일일 출석은 계속 지원합니다.",
+        "pt-BR": "Este plugin não oferece consultas nem resgates de campanhas do Trae. Use o cliente oficial para campanhas; o check-in diário continua disponível."
+      }]
+    },
+    "catpaw": {
+      "capabilities": {
+        "refresh": { "status": "unsupported" },
+        "checkin": { "status": "unsupported" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "accio": {
+      "capabilities": {
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "accio-cn": {
+      "capabilities": {
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      }
+    },
+    "antigravity": {
+      "capabilities": {
+        "checkin": { "status": "not_applicable" },
+        "claims": { "status": "not_applicable" }
+      },
+      "notes": [{
+        "zh-CN": "支持查询模型组额度窗口的剩余比例，不是现金余额。",
+        "zh-Hant": "支援查詢模型群組額度時段的剩餘比例，不是現金餘額。",
+        "en": "Reports remaining percentages for model-group quota windows, not a cash balance.",
+        "ja": "モデルグループのクォータ残量を割合で表示します。金銭の残高ではありません。",
+        "ko": "모델 그룹 할당량 기간의 잔여 비율을 표시하며 현금 잔액은 아닙니다.",
+        "pt-BR": "Exibe percentuais restantes das janelas de cota por grupo de modelos, não saldo em dinheiro."
+      }]
+    },
+    "quwork": {
+      "capabilities": {
+        "chat": { "status": "implemented_unverified" },
+        "refresh": { "status": "implemented_unverified" },
+        "model_refresh": { "status": "implemented_unverified" },
+        "usage": { "status": "implemented_unverified" },
+        "checkin": { "status": "implemented_unverified" },
+        "claims": { "status": "implemented_unverified" }
+      },
+      "notes": [{
+        "zh-CN": "基于 QuWork 1.6.0 与官方公开目录实现，尚未使用真实账号验证。本机导入只保存引用，不改官方文件；远程可粘贴凭证 JSON。模型凭证 llmToken 与登录凭证 accessToken 分开，后者用于续期、积分和奖励。每日奖励先查后领，结果不明不重复提交；月度赠送只读展示；权益兑换需填写兑换码或订单号并确认，兑换码激活需要原客户端设备标识。",
+        "zh-Hant": "依據 QuWork 1.6.0 與官方公開目錄實作，尚未以真實帳號驗證。本機匯入僅儲存參照，不改官方檔案；遠端可貼上憑證 JSON。模型憑證 llmToken 與登入憑證 accessToken 分開，後者用於續期、積分和獎勵。每日獎勵先查後領，結果不明不重複提交；月度贈送僅供查閱；權益兌換須填寫兌換碼或訂單號並確認，兌換碼啟用需要原用戶端裝置識別。",
+        "en": "Implemented against QuWork 1.6.0 and its public catalog; not validated with a real account. Local import stores a read-only reference; remote users can paste credential JSON. Model calls use llmToken; renewal, credits and rewards use accessToken. Daily rewards check status first and never repeat uncertain claims. Monthly gifts are read-only. Redemption requires a code or order number and confirmation; code activation needs the original client's device identity.",
+        "ja": "QuWork 1.6.0 と公式公開一覧を基に実装し、実アカウントでは未検証です。本機の取り込みは参照のみを保存し、公式ファイルは変更しません。リモートでは認証 JSON を貼り付けられます。モデルは llmToken、更新・ポイント・報酬は accessToken を使用します。日次報酬は事前に状態を確認し、不明な結果を再送しません。月次付与は閲覧のみです。引き換えはコードまたは注文番号と確認が必要で、コードの有効化には元のクライアントのデバイス識別情報が必要です。",
+        "ko": "QuWork 1.6.0과 공식 공개 목록을 기반으로 구현했으며 실제 계정으로 검증하지 않았습니다. 로컬 가져오기는 읽기 전용 참조만 저장하며 공식 파일을 변경하지 않습니다. 원격에서는 인증 JSON을 붙여 넣을 수 있습니다. 모델 호출은 llmToken, 갱신·포인트·보상은 accessToken을 사용합니다. 일일 보상은 상태를 먼저 확인하고 불확실한 요청은 재전송하지 않습니다. 월별 지급은 조회 전용입니다. 교환에는 코드 또는 주문 번호와 확인이 필요하며 코드 활성화에는 원래 클라이언트의 장치 식별 정보가 필요합니다.",
+        "pt-BR": "Implementado com base no QuWork 1.6.0 e no catálogo público; não validado com conta real. A importação local salva apenas uma referência de leitura, sem alterar arquivos oficiais. Remotamente, cole as credenciais JSON. Modelos usam llmToken; renovação, pontos e recompensas usam accessToken. Recompensas diárias consultam o estado antes e não repetem envios incertos. Presentes mensais são somente leitura. O resgate exige código ou número do pedido e confirmação; ativar códigos exige a identidade do dispositivo do cliente original."
+      }]
+    },
+    "doubaowork": {
+      "capabilities": {
+        "refresh": { "status": "unsupported" }
+      },
+      "notes": [{
+        "zh-CN": "基于 EchoBird 的 MIT 实现接入豆包工作：官方页面登录或完整 Cookie、账号在线模型目录、流式对话与思考、图片输入、订阅窗口和奖励额度查询、每日签到及已达成奖励领取。本机登录态直接读取客户端 Cookie 数据库与设备号，不需要调试端口。支持在对话中执行生图任务（一次一张，不支持参考图编辑）；工具调用使用文本桥接，并非原生 function calling，未伪造 Token 用量。Cookie 失效后需重新登录。未使用真实账号验证，接口和活动以官方实际返回为准。",
+        "zh-Hant": "基於 EchoBird 的 MIT 實作接入豆包工作：官方頁面登入或完整 Cookie、帳號線上模型目錄、串流對話與思考、圖片輸入、訂閱時段和獎勵額度查詢、每日簽到及已達成獎勵領取。本機登入狀態直接讀取用戶端 Cookie 資料庫與裝置號，不需要除錯連接埠。支援在對話中執行生圖任務（一次一張，不支援參考圖編輯）；工具呼叫使用文字橋接，並非原生 function calling，未偽造 Token 用量。Cookie 失效後需重新登入。尚未以真實帳號驗證，介面與活動以官方實際回傳為準。",
+        "en": "Integrates Doubao Work using EchoBird's MIT implementation: official-page login or complete cookies, account-specific online models, streaming chat and reasoning, image input, subscription windows and bonus quota, daily check-in and eligible reward claims. Desktop login import reads the client's Cookie database and device ID directly, with no debug port required. Image generation runs as a chat task (one image per task); reference-image editing is not supported. Tool calls use a text bridge, not native function calling; token usage is not fabricated. Expired cookies require a new login. Not validated with a real account; endpoints and campaigns depend on actual upstream responses.",
+        "ja": "EchoBird の MIT 実装を基に豆包工作を連携します。公式ページでのログインまたは完全な Cookie、アカウント別オンラインモデル一覧、ストリーミング対話と推論、画像入力、契約期間別と報酬のクォータ確認、毎日のチェックインと条件達成済み報酬の取得に対応します。本機のログイン状態はクライアントの Cookie データベースとデバイス ID を直接読み取って取り込み、デバッグポートは不要です。チャット内のタスクとして画像生成を実行できます（1 回 1 枚、参照画像編集は非対応）。ツール呼び出しはテキスト橋渡しでありネイティブではありません。トークン使用量は捏造しません。Cookie が無効になった場合は再ログインが必要です。実アカウントでは未検証で、API とキャンペーンは実際の応答に従います。",
+        "ko": "EchoBird의 MIT 구현을 기반으로 Doubao Work를 연동합니다. 공식 페이지 로그인 또는 전체 Cookie, 계정별 온라인 모델 목록, 스트리밍 대화 및 추론, 이미지 입력, 구독 기간과 보너스 할당량 조회, 일일 체크인 및 조건을 충족한 보상 수령을 지원합니다. 로컬 로그인 상태는 클라이언트의 Cookie 데이터베이스와 장치 ID를 직접 읽어 가져오며 디버그 포트가 필요 없습니다. 채팅 작업으로 이미지 생성을 실행할 수 있습니다(작업당 1장, 참조 이미지 편집은 지원하지 않음). 도구 호출은 텍스트 연결이며 네이티브 function calling이 아닙니다. 토큰 사용량을 꾸며내지 않습니다. Cookie가 만료되면 다시 로그인해야 합니다. 실제 계정으로 검증하지 않았으며 API와 이벤트는 상위 서비스 응답에 따릅니다.",
+        "pt-BR": "Integra o Doubao Work com a implementação MIT do EchoBird: login na página oficial ou cookies completos, modelos online por conta, chat e raciocínio em streaming, entrada de imagens, janelas da assinatura e cota bônus, check-in diário e resgate de recompensas elegíveis. A importação do login local lê diretamente o banco de cookies e o ID do dispositivo do cliente, sem porta de depuração. A geração de imagens roda como uma tarefa de chat (uma imagem por tarefa); a edição com imagem de referência não é suportada. Ferramentas usam uma ponte de texto, não function calling nativo; o uso de tokens não é inventado. Cookies expirados exigem novo login. Não validado com conta real; APIs e campanhas dependem das respostas upstream."
+      }]
+    }
+  }
+}

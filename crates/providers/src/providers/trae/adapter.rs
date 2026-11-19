@@ -86,10 +86,8 @@ impl Provider for TraeProvider {
                 },
             ])
             .with_models(models::list())
-            // 账号行：`edition: false` 是事实 —— 国内 SOLO 与国际版是**两套协议**
-            // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id。
-            //   `usage` 对应 `usage` 模块（上游两份账：`ide_user_ent_usage` 的
-            //     权益包 / 积分池 + `ide_user_pay_status` 的快请求与 SOLO 并发）。
+            // 国际版需要独立的 provider id；国内 Agent / IDE 共用本家身份。
+            // `usage` 读取权益包与快请求额度，
             //   `credit_detail` —— 同一份 ent_usage 里还读得到**逐份权益包**的
             //     `start_time` / `expire_time`（领取 → 到期）。签到发的包会按天
             //     堆起来，哪一份先作废只有这份清单答得上来。
@@ -103,20 +101,28 @@ impl Provider for TraeProvider {
                 expiry: vec!["expiresAt".to_string(), "expiresAtMs".to_string()],
                 ..Default::default()
             })
-        .with_checkin(proto::CheckinInfo {
-            description: Some("SOLO 的 checkin_credits 领取 · 按自然日 0 点刷新".to_string()),
-            modes: vec![proto::CheckinMode::Checkin],
-            ..Default::default()
-        })
+            .with_checkin(proto::CheckinInfo {
+                description: Some("Trae 每日签到积分领取 · 按自然日 0 点刷新".to_string()),
+                modes: vec![proto::CheckinMode::Checkin],
+                ..Default::default()
+            })
     }
 
     /// 模型清单 = 上一次成功刷到的那张远程表（没刷到时为空，见 `models.rs`）。
     fn models<'a>(
         &'a self,
-        _ctx: &'a PluginCtx,
-        _account: &'a str,
+        ctx: &'a PluginCtx,
+        account: &'a str,
     ) -> SendFuture<'a, proto::ModelList> {
         Box::pin(async move {
+            if !account.trim().is_empty() {
+                let record = crate::store::record(ctx, PROVIDER_ID, account).await?;
+                let credential = Credential::from_payload(&record)?;
+                return Ok(proto::ModelList {
+                    models: models::list_for(&credential),
+                    meta: models::meta_for(&credential),
+                });
+            }
             Ok(proto::ModelList {
                 models: models::list(),
                 meta: proto::CatalogMeta {
@@ -138,7 +144,7 @@ impl Provider for TraeProvider {
             let mut sink = sink;
             super::forward::forward(ctx, req, &mut sink)
                 .await
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 
@@ -175,7 +181,9 @@ impl Provider for TraeProvider {
             // 只有落到「其它 4xx」这一档才交给跨家的内容拦截判定：本家的
             // 请求级分类（过大 / 通道不可用 / 404）必须优先，把它们误判成
             // 内容拦截会触发一次无意义的同账号重试。
-            ErrorKind::Client => content_block::classify_or_fatal(status, error_body, message, code),
+            ErrorKind::Client => {
+                content_block::classify_or_fatal(status, error_body, message, code)
+            }
             // Server / NotFound / InputTooLarge / ModelUnavailable / None
             // 都不该罚账号。
             _ => proto::ErrorClass::Fatal {
@@ -188,7 +196,11 @@ impl Provider for TraeProvider {
 
     /// 取可用令牌：临期（24h 窗口）或签发龄超 15 天时主动续期并回写。
     fn ensure_token<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, String> {
-        Box::pin(async move { ensure_token_inner(ctx, account).await.map_err(|error| error.message) })
+        Box::pin(async move {
+            ensure_token_inner(ctx, account)
+                .await
+                .map_err(|error| error.message)
+        })
     }
 
     /// 401 后的强制刷新：**无视临期判定直接换发**。
@@ -197,7 +209,11 @@ impl Provider for TraeProvider {
     /// `ensure_token` 的临期门（那会原样返回刚被拒的串，让编排层的
     /// 「刷新后重试一次」退化成「用同一个坏 token 再打一次」）。
     fn refresh_token<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, String> {
-        Box::pin(async move { refresh_token_inner(ctx, account).await.map_err(|error| error.message) })
+        Box::pin(async move {
+            refresh_token_inner(ctx, account)
+                .await
+                .map_err(|error| error.message)
+        })
     }
 
     /// 后台凭证维护问「这条账号是不是快到期了」。
@@ -266,16 +282,39 @@ impl Provider for TraeProvider {
                 // 「从本机看得到」的表，而用户以为刷的是那条账号的出口。
                 Err(error) => return Ok(proto::RefreshOutcome::failed(error.message)),
             };
+            let credential = renew_if_due(ctx, &record, &credential, proxy.as_ref()).await?;
             Ok(models::refresh(&credential, proxy.as_ref(), force).await)
         })
     }
 
+    /// 额度来源声明（形状契约见 trait 文档）。
+    fn quota_sources(&self, report: &Value) -> Vec<Value> {
+        crate::quota::sources(&self.meta().id, report)
+    }
+
     /// 额度读数（形状契约见 trait 文档；本家的实现细节在 `usage.rs`）。
+    ///
+    /// ── 为什么这里必须是 `into_control_message` 而不是 `into_message` ──
+    /// `usage.rs` 对上游 401（`code:1001` 会话被作废）返回的是一条**带状态码**
+    /// 的错误（`GatewayError::with_status(401, …)`），而控制面的错误通道只有
+    /// 一个 `String`。`into_message` 只留文案，网关那一侧就再也看不出这是 401 ——
+    /// `core::usage_query::query_usage_inner` 的两条分支都靠 `status_code == 401`
+    /// 判定，状态码一丢它们**永远不触发**：
+    ///
+    ///   1. 「401 → 刷新后同账号重试一次」不会发生（本可自愈的临期账号也失去这条路径）；
+    ///   2. 「刷新也失败 → 落 `usage_credential_dead` 并按 1 小时退避」不会发生，
+    ///      自动查询按 60 秒间隔**无限重打**同一个死凭证 —— 生产实测一个被上游
+    ///      吊销的账号每 ~67 秒产生一条 `余额查询失败`，一晚上几十条。
+    ///
+    /// `into_control_message` 把状态码 / 业务码 / 上游码封进 `provider_http:`
+    /// 信封，网关的 `plugin_host::errors::control_error` 会原样还原成
+    /// `GatewayError`（含 401）。与 CodeArts 的余额链同一处置 —— 两处口径
+    /// 分叉过一次（见 `provider-sdk::errors` 的 `control_roundtrip` 用例），别再来一次。
     fn usage<'a>(&'a self, ctx: &'a PluginCtx, account: &'a str) -> SendFuture<'a, Value> {
         Box::pin(async move {
             super::usage::query_usage(ctx, account)
                 .await
-                .map_err(GatewayError::into_message)
+                .map_err(GatewayError::into_control_message)
         })
     }
 
@@ -287,7 +326,7 @@ impl Provider for TraeProvider {
         Box::pin(async move {
             let value = super::checkin::claim_daily_checkin(ctx, account)
                 .await
-                .map_err(GatewayError::into_message)?;
+                .map_err(GatewayError::into_control_message)?;
             Ok(super::checkin_report(&value))
         })
     }

@@ -43,6 +43,7 @@
 
 pub mod daily_activity;
 pub mod events;
+mod expert_tasks;
 pub mod school;
 pub mod spec;
 pub mod streak;
@@ -89,6 +90,8 @@ pub struct GrowthAccount {
     /// 的 `X-Domain` 头就来自它（请求形态是实测沉淀的一部分）。
     pub domain: String,
     pub proxy: Option<agent2api_provider_protocol::WireProxy>,
+    pub session: Value,
+    pub ctx: Option<agent2api_provider_sdk::PluginCtx>,
 }
 
 impl GrowthAccount {
@@ -131,7 +134,7 @@ impl GrowthAccount {
         let proxy = session
             .get("proxy")
             .and_then(|value| serde_json::from_value(value.clone()).ok());
-        Some(Self { uid, nick, token, domain, proxy })
+        Some(Self { uid, nick, token, domain, proxy, session: session.clone(), ctx: None })
     }
 
     /// 稳定派生一个 36 位 hex 设备标识（machineId / sessionId 用，幂等）。
@@ -206,6 +209,14 @@ pub async fn growth_request(
     body: Option<&Value>,
     headers: &[(String, String)],
 ) -> Result<GrowthCall, String> {
+    if url::Url::parse(url).ok().is_some_and(|url| url.origin().ascii_serialization() == WEB_BASE) {
+        let ctx = account.ctx.as_ref().ok_or_else(|| "网页任务缺少账号上下文，未回退使用 Bearer".to_string())?;
+        let path = url.strip_prefix(WEB_BASE).ok_or_else(|| "网页地址不在官方域内".to_string())?;
+        let id = account.session.get("id").and_then(Value::as_str).unwrap_or("");
+        let response = super::web_session::request(ctx, super::Region::Cn, id, method, path, body, headers).await
+            .map_err(|error| error.message)?;
+        return Ok(GrowthCall { status: response.status, payload: response.payload });
+    }
     let mut final_headers: Vec<(String, String)> = vec![
         ("Authorization".to_string(), format!("Bearer {}", account.token)),
         ("Accept".to_string(), "application/json".to_string()),
@@ -550,7 +561,7 @@ pub async fn process_task(account: &GrowthAccount, code: &str, task: &Value) -> 
             energy: 0,
         };
     };
-    if spec.unforgeable {
+    if spec.unforgeable && accept_status != "claimed" && accept_status != "completed" && cur < target {
         return TaskReport {
             code: code.to_string(),
             outcome: TaskOutcome::Skipped,
@@ -629,7 +640,12 @@ pub async fn process_task(account: &GrowthAccount, code: &str, task: &Value) -> 
 
     // 对象 id 来源（scenes / 专家 / 技能 / 案例 / 主题；无对象类返回空占位）
     let objects: Vec<ObjectId> = if need > 0 {
-        match ids_for(&spec.kind, account, need as usize, cur.max(0) as usize).await {
+        let resolved = if spec.kind == "expert-task" {
+            expert_tasks::resolve(account, task).await.map(|expert| vec![expert])
+        } else {
+            ids_for(&spec.kind, account, need as usize, cur.max(0) as usize).await
+        };
+        match resolved {
             Ok(list) => list,
             Err(error) => {
                 return TaskReport {
@@ -655,7 +671,14 @@ pub async fn process_task(account: &GrowthAccount, code: &str, task: &Value) -> 
     }
 
     // 按 kind 分派上报（各 kind 的域/指纹/事件形状在 events.rs）
-    let report_error = events::light_up(account, code, &spec.kind, &objects, need as usize).await;
+    let report_error = if spec.kind == "expert-task" {
+        match objects.first() {
+            Some(expert) => expert_tasks::use_expert(account, expert).await.err(),
+            None => Some("任务未提供指定专家".to_string()),
+        }
+    } else {
+        events::light_up(account, code, &spec.kind, &objects, need as usize).await
+    };
     if let Some(error) = report_error {
         logging::log("[Growth]", &format!("{uid8} {code}: 上报失败 {error}"));
         return TaskReport {

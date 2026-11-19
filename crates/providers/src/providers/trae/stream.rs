@@ -5,18 +5,15 @@
 //!    上游中途断掉（没有 done）也要补，否则客户端永远等在最后一片上。
 //! 2. **业务错误藏在 200 的流里**（`event: error`）。它不是 chunk，
 //!    而是一条 `event: error` + `[DONE]`；分类见 `errors.rs`。
-//! 3. **`token_usage` 是"欠着"的**：读到它并不立刻发帧，而是挂在下一帧
-//!    （正常就是那条 finish 帧）上一起走。所以"usage 之后流就断了"这种
-//!    上游行为会让 usage **静默消失** —— 向量里就有这一例，照抄行为、
-//!    在 M7 的对拍报告里记一笔，不偷偷改。
+//! 3. `token_usage` 随下一帧发送；EOF 或传输失败时仍须冲刷已收到的用量。
 //!
 //! 帧的**键顺序**不是契约（Go 的 map 序列化按 key 排序，serde 按插入顺序），
 //! 所以测试比的是解析后的 JSON；`id` 与 `created` 每次运行都不同，
 //! 向量里已归一成 `<ID>` / `<CREATED>`。
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use super::errors::{ErrorKind, error_event_fields, stream_error_kind};
+use super::errors::{error_event_fields, stream_error_kind, ErrorKind};
 
 /// 一条已解析的上游事件。`metadata` / `timing_cost` / `extra_info` / 未知名
 /// 都归到 `Other`：当前实现**不处理**它们（`extra_info` 在两个 switch 里都落空，
@@ -42,34 +39,107 @@ pub enum SoloEvent {
 /// 解析一条完整事件（`data` 是同一事件内多行 `data:` 累加后的结果）。
 /// JSON 不合法时返回 `None` —— 参考实现是"忽略这一帧"，不是"报错断流"。
 pub fn parse_solo_event(event: &str, data: &str) -> Option<SoloEvent> {
-    if data.trim().is_empty() {
-        // 只有 event 行没有 data：仍算一个事件边界（done 之类可能不带载荷）。
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
         return Some(match event {
-            "done" => SoloEvent::Done { finish_reason: String::new() },
+            "done" | "response_done" | "stream_done" => SoloEvent::Done {
+                finish_reason: "stop".to_string(),
+            },
+            _ if data.trim() == "[DONE]" => SoloEvent::Done {
+                finish_reason: "stop".to_string(),
+            },
             _ => SoloEvent::Other,
         });
     }
-    let parsed: Value = serde_json::from_str(data).ok()?;
-    Some(match event {
-        "output" => SoloEvent::Output {
-            response: parsed.get("response").and_then(Value::as_str).unwrap_or_default().to_string(),
-            reasoning: parsed
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            tool_calls: parsed.get("tool_calls").cloned().filter(|value| !value.is_null()),
-        },
-        "token_usage" => SoloEvent::TokenUsage(parsed),
-        "done" => SoloEvent::Done {
-            finish_reason: parsed.get("finish_reason").and_then(Value::as_str).unwrap_or_default().to_string(),
-        },
-        "error" => {
-            let (code, message) = error_event_fields(&parsed);
-            SoloEvent::Error { code, message }
+    let mut parsed: Value = serde_json::from_str(data).ok()?;
+    if let Some(inner) = parsed
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    {
+        if inner.is_object() {
+            parsed = inner;
         }
+    }
+    let event = if event.is_empty() {
+        parsed
+            .get("event")
+            .or_else(|| parsed.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    } else {
+        event
+    };
+    let (code, message) = error_event_fields(&parsed);
+    if event == "error"
+        || parsed.get("error").is_some_and(|error| !error.is_null())
+        || (code != 0
+            && !message.is_empty()
+            && !parsed.get("response").is_some_and(Value::is_string))
+    {
+        return Some(SoloEvent::Error { code, message });
+    }
+    Some(match event {
+        "" | "output" | "message" | "delta" | "content" | "text" | "answer" | "chunk"
+        | "output_delta" | "message_delta" => {
+            let empty = Value::Null;
+            let delta = parsed
+                .get("delta")
+                .filter(|value| value.is_object())
+                .unwrap_or(&empty);
+            let response = first_text(&[
+                parsed.get("response"),
+                parsed.get("content"),
+                delta.get("content"),
+                parsed.get("delta"),
+                parsed.get("text"),
+                parsed.get("message"),
+            ]);
+            let reasoning = first_text(&[
+                parsed.get("reasoning_content"),
+                parsed.get("reasoning"),
+                delta.get("reasoning_content"),
+                delta.get("reasoning"),
+            ]);
+            SoloEvent::Output {
+                response,
+                reasoning,
+                tool_calls: parsed
+                    .get("tool_calls")
+                    .or_else(|| delta.get("tool_calls"))
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+            }
+        }
+        "token_usage" => SoloEvent::TokenUsage(parsed.get("usage").cloned().unwrap_or(parsed)),
+        "done" | "response_done" | "stream_done" => SoloEvent::Done {
+            finish_reason: finish_reason(&parsed),
+        },
         _ => SoloEvent::Other,
     })
+}
+
+fn first_text(values: &[Option<&Value>]) -> String {
+    values
+        .iter()
+        .filter_map(|value| value.and_then(Value::as_str))
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn finish_reason(value: &Value) -> String {
+    let reason = value
+        .get("finish_reason")
+        .or_else(|| value.get("stop_reason"))
+        .or_else(|| value.get("finishReason"))
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    match reason {
+        "max_tokens" | "max_output_tokens" | "max_length" => "length",
+        "sensitive" => "content_filter",
+        "" => "stop",
+        other => other,
+    }
+    .to_string()
 }
 
 /// 一行一行的 SSE 状态机（跨行累积 `event:` 与多个 `data:`）。
@@ -85,7 +155,7 @@ impl SseScanner {
     pub fn feed_line(&mut self, line: &str) -> Option<SoloEvent> {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
-            if self.event.is_empty() {
+            if self.event.is_empty() && self.data.is_empty() {
                 self.reset();
                 return None;
             }
@@ -102,6 +172,12 @@ impl SseScanner {
         }
         // `:` 开头是注释行，忽略；其它前缀（含 `id:`）同样忽略。
         None
+    }
+
+    fn finish(&mut self) -> Option<SoloEvent> {
+        let event = parse_solo_event(&self.event, &self.data);
+        self.reset();
+        event
     }
 
     fn reset(&mut self) {
@@ -138,7 +214,10 @@ impl Frame {
             Self::Error { code, message, .. } => {
                 // 与参考实现同一条文案：`solo error code=<码> msg=<文案>`，
                 // 载荷是**一个 JSON 字符串**而不是对象。
-                format!("event: error\ndata: {}", json!(format!("solo error code={code} msg={message}")))
+                format!(
+                    "event: error\ndata: {}",
+                    json!(format!("solo error code={code} msg={message}"))
+                )
             }
             Self::Done => "data: [DONE]".to_string(),
         }
@@ -152,16 +231,37 @@ pub struct SoloStream {
     scanner: SseScanner,
     /// `token_usage` 读到后欠着，随下一帧一起发。
     pending_usage: Option<Value>,
+    reasoning: String,
+    last_reasoning: String,
+    had_error: bool,
+    saw_output: bool,
+    tool_calls_seen: bool,
     saw_done: bool,
+    completed: bool,
 }
 
 impl SoloStream {
     pub fn new(id: String, created: i64) -> Self {
-        Self { id, created, scanner: SseScanner::default(), pending_usage: None, saw_done: false }
+        Self {
+            id,
+            created,
+            scanner: SseScanner::default(),
+            pending_usage: None,
+            reasoning: String::new(),
+            last_reasoning: String::new(),
+            had_error: false,
+            saw_output: false,
+            tool_calls_seen: false,
+            saw_done: false,
+            completed: false,
+        }
     }
 
     /// 喂一行，返回该行产生的帧。
     pub fn feed_line(&mut self, line: &str) -> Vec<Frame> {
+        if self.completed {
+            return Vec::new();
+        }
         let Some(event) = self.scanner.feed_line(line) else {
             return Vec::new();
         };
@@ -170,20 +270,33 @@ impl SoloStream {
 
     fn apply(&mut self, event: SoloEvent) -> Vec<Frame> {
         match event {
-            SoloEvent::Output { response, reasoning, tool_calls } => {
+            SoloEvent::Output {
+                response,
+                reasoning,
+                tool_calls,
+            } => {
+                if self.had_error {
+                    return Vec::new();
+                }
                 let mut delta = serde_json::Map::new();
                 if !response.is_empty() {
                     delta.insert("content".to_string(), json!(response));
                 }
+                let reasoning = self.reasoning_delta(reasoning);
                 if !reasoning.is_empty() {
                     delta.insert("reasoning_content".to_string(), json!(reasoning));
                 }
                 if let Some(calls) = tool_calls {
-                    delta.insert("tool_calls".to_string(), normalize_stream_tool_calls(calls));
+                    let calls = normalize_stream_tool_calls(calls);
+                    if calls.as_array().is_some_and(|calls| !calls.is_empty()) {
+                        self.tool_calls_seen = true;
+                        delta.insert("tool_calls".to_string(), calls);
+                    }
                 }
                 if delta.is_empty() {
                     return Vec::new();
                 }
+                self.saw_output = true;
                 vec![self.chunk(Value::Object(delta), None)]
             }
             SoloEvent::TokenUsage(usage) => {
@@ -191,28 +304,91 @@ impl SoloStream {
                 Vec::new()
             }
             SoloEvent::Done { finish_reason } => {
+                self.completed = true;
+                let sent = self.saw_done;
                 self.saw_done = true;
-                vec![self.chunk(json!({}), Some(finish_reason)), Frame::Done]
+                let finish = if finish_reason == "stop" && self.tool_calls_seen {
+                    "tool_calls".to_string()
+                } else {
+                    finish_reason
+                };
+                let mut frames = if self.had_error {
+                    if self.pending_usage.is_some() {
+                        vec![self.chunk(json!({}), None)]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    vec![self.chunk(json!({}), Some(finish))]
+                };
+                if !sent {
+                    frames.push(Frame::Done);
+                }
+                frames
             }
             SoloEvent::Error { code, message } => {
+                self.had_error = true;
                 let kind = stream_error_kind(code, &message);
-                self.saw_done = true;
-                // 注意：这里**不终止读取**，所以后面再来 `done` 会再发一整套
-                // 帧（向量 `流内错误 4008` 记的就是这个形状）。转发层在首包门
-                // 之前看到这条 error 就会改判成 HTTP 错误，正常不会走到第二步。
-                vec![Frame::Error { code, message, kind }, Frame::Done]
+                // error 后仍读取可能到来的用量；只有完整 done 事件结束读取。
+                vec![Frame::Error {
+                    code,
+                    message,
+                    kind,
+                }]
             }
             SoloEvent::Other => Vec::new(),
         }
     }
 
-    /// 流结束（EOF）。上游没给过 `done` 时补一个 `[DONE]`，保证客户端能收尾。
+    fn reasoning_delta(&mut self, incoming: String) -> String {
+        let duplicate = (incoming == self.last_reasoning && incoming.chars().count() >= 8)
+            || (self.reasoning.chars().count() >= 16
+                && incoming.chars().count() >= 16
+                && self.reasoning.ends_with(&incoming));
+        self.last_reasoning = incoming.clone();
+        if duplicate {
+            return String::new();
+        }
+        let delta = if self.reasoning.chars().count() >= 16 {
+            incoming
+                .strip_prefix(&self.reasoning)
+                .unwrap_or(&incoming)
+                .to_string()
+        } else {
+            incoming
+        };
+        self.reasoning.push_str(&delta);
+        delta
+    }
+
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+
+    /// 补发的 [DONE] 只供客户端收尾，不代表上游正常结束；判定前须冲刷尾事件。
+    pub fn missing_terminal(&self) -> bool {
+        self.saw_output && !self.completed && !self.had_error
+    }
+
+    pub fn flush_pending(&mut self) -> Vec<Frame> {
+        let mut frames = match self.scanner.finish() {
+            Some(event) => self.apply(event),
+            None => Vec::new(),
+        };
+        if self.pending_usage.is_some() {
+            frames.push(self.chunk(json!({}), None));
+        }
+        frames
+    }
+
+    /// EOF 时保留已收到的尾数据与用量，结束标记只发一次。
     pub fn finish(&mut self) -> Vec<Frame> {
-        if self.saw_done {
-            return Vec::new();
+        let mut frames = self.flush_pending();
+        if !self.saw_done {
+            frames.push(Frame::Done);
         }
         self.saw_done = true;
-        vec![Frame::Done]
+        frames
     }
 
     fn chunk(&mut self, delta: Value, finish_reason: Option<String>) -> Frame {
@@ -227,7 +403,10 @@ impl SoloStream {
         chunk.insert("object".to_string(), json!("chat.completion.chunk"));
         chunk.insert("created".to_string(), json!(self.created));
         chunk.insert("model".to_string(), json!(""));
-        chunk.insert("choices".to_string(), Value::Array([Value::Object(choice)].to_vec()));
+        chunk.insert(
+            "choices".to_string(),
+            Value::Array([Value::Object(choice)].to_vec()),
+        );
         if let Some(usage) = self.pending_usage.take() {
             chunk.insert("usage".to_string(), usage);
         }
@@ -239,10 +418,18 @@ impl SoloStream {
 /// 并剥掉 SOLO 专属的 `namespace` / `partial_arguments`（上游带着它们）。
 fn normalize_stream_tool_calls(calls: Value) -> Value {
     let Value::Array(list) = calls else {
-        // 上游偶尔给单个对象；按参考实现的处理方式包成数组。
-        return Value::Array(vec![normalize_one_call(calls)]);
+        return if calls.is_object() {
+            Value::Array(vec![normalize_one_call(calls)])
+        } else {
+            json!([])
+        };
     };
-    Value::Array(list.into_iter().map(normalize_one_call).collect())
+    Value::Array(
+        list.into_iter()
+            .filter(|call| call.is_object())
+            .map(normalize_one_call)
+            .collect(),
+    )
 }
 
 fn normalize_one_call(call: Value) -> Value {
@@ -266,92 +453,66 @@ fn strip_solo_only_fields(function: Value) -> Value {
     Value::Object(function)
 }
 
-/// 一条流内错误（非流式聚合时作为失败返回）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StreamError {
-    pub code: i64,
-    pub message: String,
-}
-
-impl StreamError {
-    /// `#[allow(dead_code)]`：分类在 `errors::stream_error_kind` 里按码判，
-    /// 这个便捷方法留给调用方（当前都直接调那个函数）。
-    #[allow(dead_code)]
-    pub fn kind(&self) -> ErrorKind {
-        stream_error_kind(self.code, &self.message)
-    }
-
-    /// 与参考实现逐字同形的文案（对拍时要能直接对照日志）。
-    #[allow(dead_code)]
-    pub fn to_text(&self) -> String {
-        format!("solo error code={} msg={}", self.code, self.message)
-    }
-}
-
-/// 非流式：把整条 SSE 折成一个 `chat.completion`。
-///
-/// 上游没有非流式端点（`stream` 被强制成 true），所以这一条是**唯一**的
-/// 非流式实现路径，不是"流式的替代品"。
-pub fn aggregate(text: &str, id: &str, created: i64) -> Result<Value, StreamError> {
-    let mut scanner = SseScanner::default();
+pub fn aggregate_chunks(chunks: &[Value], requested: &str) -> Value {
     let mut content = String::new();
     let mut reasoning = String::new();
-    let mut finish_reason = "stop".to_string();
-    let mut usage: Option<Value> = None;
-    let mut calls: Vec<Value> = Vec::new();
-    let mut upstream_error: Option<StreamError> = None;
-
-    // 与 Go 的 `ReadString('\n')` 对齐：按行喂，**EOF 那一次还会再喂一个空行**
-    // （那一下把最后一个没被空行闭合的事件推出去）。少喂这一行，
-    // 结尾没有空行的流就会丢掉最后一帧。
-    for line in text.split('\n').chain(std::iter::once("")) {
-        let Some(event) = scanner.feed_line(line) else {
-            continue;
-        };
-        match event {
-            SoloEvent::Output { response, reasoning: thought, tool_calls } => {
-                content.push_str(&response);
-                reasoning.push_str(&thought);
-                if let Some(calls_value) = tool_calls {
-                    merge_tool_calls(&mut calls, calls_value);
-                }
-            }
-            SoloEvent::TokenUsage(payload) => usage = Some(payload),
-            SoloEvent::Done { finish_reason: reason } => {
-                if !reason.is_empty() {
-                    finish_reason = reason;
-                }
-            }
-            SoloEvent::Error { code, message } => upstream_error = Some(StreamError { code, message }),
-            SoloEvent::Other => {}
+    let mut calls = Vec::new();
+    let mut finish = "stop".to_string();
+    let mut usage = None;
+    for chunk in chunks {
+        let choice = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first());
+        let delta = choice.and_then(|choice| choice.get("delta"));
+        if let Some(text) = delta
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
+        {
+            content.push_str(text);
+        }
+        if let Some(text) = delta
+            .and_then(|delta| delta.get("reasoning_content"))
+            .and_then(Value::as_str)
+        {
+            reasoning.push_str(text);
+        }
+        if let Some(incoming) = delta.and_then(|delta| delta.get("tool_calls")) {
+            merge_tool_calls(&mut calls, incoming.clone());
+        }
+        if let Some(reason) = choice
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        {
+            finish = reason.to_string();
+        }
+        if let Some(value) = chunk.get("usage") {
+            usage = Some(value.clone());
         }
     }
-
-    if let Some(error) = upstream_error {
-        return Err(error);
-    }
-    let mut message = serde_json::Map::new();
-    message.insert("role".to_string(), json!("assistant"));
-    message.insert("content".to_string(), json!(content));
+    let mut message = json!({ "role": "assistant", "content": content });
     if !reasoning.is_empty() {
-        message.insert("reasoning_content".to_string(), json!(reasoning));
+        message["reasoning_content"] = json!(reasoning);
     }
     if !calls.is_empty() {
-        message.insert("tool_calls".to_string(), Value::Array(calls));
+        message["tool_calls"] = json!(calls);
+        if finish == "stop" {
+            finish = "tool_calls".to_string();
+        }
     }
-    let mut response = serde_json::Map::new();
-    response.insert("id".to_string(), json!(id));
-    response.insert("object".to_string(), json!("chat.completion"));
-    response.insert("created".to_string(), json!(created));
-    response.insert("model".to_string(), json!(""));
-    response.insert(
-        "choices".to_string(),
-        json!([{"index": 0, "message": Value::Object(message), "finish_reason": finish_reason}]),
-    );
+    let first = chunks.first();
+    let mut response = json!({
+        "id": first.and_then(|chunk| chunk.get("id")).cloned().unwrap_or(Value::Null),
+        "object": "chat.completion",
+        "created": first.and_then(|chunk| chunk.get("created")).cloned().unwrap_or(Value::Null),
+        "model": requested,
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+    });
     if let Some(usage) = usage {
-        response.insert("usage".to_string(), usage);
+        response["usage"] = usage;
     }
-    Ok(Value::Object(response))
+    response
 }
 
 /// 按 `index` 合并流式 tool_call 片段：`id` / `type` / `function.name` 直覆盖，
@@ -365,22 +526,34 @@ fn merge_tool_calls(calls: &mut Vec<Value>, incoming: Value) {
     for call in list {
         let Value::Object(call) = call else { continue };
         let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
-        let slot = match calls.iter_mut().find(|existing| {
-            existing.get("index").and_then(Value::as_i64).unwrap_or(0) == index
-        }) {
+        let slot = match calls
+            .iter_mut()
+            .find(|existing| existing.get("index").and_then(Value::as_i64).unwrap_or(0) == index)
+        {
             Some(existing) => existing,
             None => {
                 calls.push(json!({"index": index}));
-                calls.last_mut().expect("刚推进去")
+                match calls.last_mut() {
+                    Some(slot) => slot,
+                    None => continue,
+                }
             }
         };
         let Some(target) = slot.as_object_mut() else {
             continue;
         };
-        if let Some(id) = call.get("id").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        if let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             target.insert("id".to_string(), json!(id));
         }
-        if let Some(kind) = call.get("type").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        if let Some(kind) = call
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             target.insert("type".to_string(), json!(kind));
         }
         let delta_function = call
@@ -392,17 +565,32 @@ fn merge_tool_calls(calls: &mut Vec<Value>, incoming: Value) {
         let Some(delta_function) = delta_function else {
             continue;
         };
-        let merged = target.entry("function".to_string()).or_insert_with(|| json!({}));
+        let merged = target
+            .entry("function".to_string())
+            .or_insert_with(|| json!({}));
         let Some(merged) = merged.as_object_mut() else {
             continue;
         };
-        if let Some(name) = delta_function.get("name").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        if let Some(name) = delta_function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             merged.insert("name".to_string(), json!(name));
         }
-        if let Some(arguments) = delta_function.get("arguments").and_then(Value::as_str).filter(|value| !value.is_empty()) {
-            let previous = merged.get("arguments").and_then(Value::as_str).unwrap_or_default();
-            merged.insert("arguments".to_string(), json!(format!("{previous}{arguments}")));
+        if let Some(arguments) = delta_function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            let previous = merged
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            merged.insert(
+                "arguments".to_string(),
+                json!(format!("{previous}{arguments}")),
+            );
         }
     }
 }
-

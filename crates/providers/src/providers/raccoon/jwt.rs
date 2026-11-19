@@ -38,6 +38,52 @@ pub fn decode_jwt_claims(token: &str) -> Option<Value> {
     }
 }
 
+/// IAM 的 issuer 以 `/iam` 结尾；这里只识别协议，签名仍由上游校验。
+pub fn is_iam_token(token: &str) -> bool {
+    decode_jwt_claims(token)
+        .and_then(|claims| {
+            claims
+                .get("iss")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|issuer| issuer.ends_with("/iam"))
+}
+
+pub(super) fn validate_iam_token(token: &str) -> Result<(), crate::errors::GatewayError> {
+    let claims = decode_jwt_claims(token).unwrap_or(Value::Null);
+    let issuer = std::env::var("RACCOON_IAM_ISSUER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            url::Url::parse(&super::auth_api_base())
+                .ok()
+                .and_then(|url| {
+                    let host = url.host_str()?;
+                    Some(match url.port() {
+                        Some(port) => format!("{host}:{port}/iam"),
+                        None => format!("{host}/iam"),
+                    })
+                })
+                .unwrap_or_else(|| "xiaohuanxiong.com/iam".to_string())
+        });
+    let valid = claims.get("iss").and_then(Value::as_str) == Some(issuer.as_str())
+        && claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .is_some_and(|subject| !subject.trim().is_empty())
+        && jwt_expiry_ms(token).is_some_and(|expires| expires > crate::logging::now_ms() as f64);
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::errors::GatewayError::with_status(
+            401,
+            "小浣熊 IAM 登录态无效或已过期，请在官方客户端重新登录后再导入",
+        ))
+    }
+}
+
 /// token 的过期时间（毫秒）；没有 `exp` 或 token 不可解析时 None
 /// （源实现 `jwtExpiryMs`）。`exp` 是**秒**，这里换算成毫秒。
 pub fn jwt_expiry_ms(token: &str) -> Option<f64> {
@@ -60,6 +106,18 @@ pub fn jwt_expiry_ms(token: &str) -> Option<f64> {
 /// 两条路径都必须实现：少了任何一条都会让一批账号的 userId 变成空串，
 /// 而 userId 正是小浣熊账号的标识。
 pub fn extract_user_id(claims: &Value) -> String {
+    if claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .is_some_and(|issuer| issuer.ends_with("/iam"))
+    {
+        return claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+    }
     for key in ["sid", "iss"] {
         if let Some(value) = claims.get(key).and_then(hex_id_to_decimal) {
             if !value.is_empty() {
@@ -185,20 +243,32 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 /// 去 `Bearer ` 前缀（大小写不敏感，至少一个空白），不匹配时原样返回
 /// （与源实现 `String.replace(/^Bearer\s+/i, '')` 一致）
+///
+/// ── 为什么循环剥到底（与 `crypto::strip_bearer` 同一取舍）────────
+/// 只剥一次时，存量脏值 `Bearer Bearer eyJ…`（旧版本原样落库的双前缀值）
+/// 会剥成 `Bearer eyJ…`，调用方再拼一个就又是双前缀 —— 与没修一样。
+/// `raccoon/balance.rs` 正是「剥完再拼」的用法，所以这里必须剥干净。
 pub fn strip_bearer(value: &str) -> String {
     const PREFIX: &str = "bearer";
-    let trimmed = value.trim();
-    if trimmed.len() < PREFIX.len() {
-        return trimmed.to_string();
+    let mut current = value.trim();
+    loop {
+        if current.len() < PREFIX.len() {
+            return current.to_string();
+        }
+        let (head, rest) = current.split_at(PREFIX.len());
+        if !head.eq_ignore_ascii_case(PREFIX) {
+            return current.to_string();
+        }
+        // 恰好等于 `Bearer`：只有前缀没有凭证，给空串（见 crypto 同名函数的说明）
+        if rest.is_empty() {
+            return String::new();
+        }
+        if rest.trim_start().len() == rest.len() {
+            // `Bearerxyz`：前缀后没有空白，不构成前缀
+            return current.to_string();
+        }
+        current = rest.trim_start();
     }
-    let (head, rest) = trimmed.split_at(PREFIX.len());
-    if !head.eq_ignore_ascii_case(PREFIX) {
-        return trimmed.to_string();
-    }
-    if rest.trim_start().len() == rest.len() {
-        return trimmed.to_string();
-    }
-    rest.trim_start().to_string()
 }
 
 /// JS `String(x)`（字符串原样、数字/布尔按字面量、null 给空串）

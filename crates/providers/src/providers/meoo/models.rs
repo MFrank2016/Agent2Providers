@@ -291,7 +291,7 @@ fn snapshot() -> proto::ModelList {
 
 /// 发一次目录请求（项目服务 AK + CLI 头），非 2xx 也原样返回。
 async fn request(ctx: &PluginCtx, ak: &str, project: &str) -> Result<(u16, Value), GatewayError> {
-    let client = http::client(None, &ctx.env.proxy);
+    let client = http::control_client(None, &ctx.env.proxy);
     http::get_json(
         &client,
         &endpoints::models_url(&endpoints::gateway_base()),

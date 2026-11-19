@@ -54,7 +54,8 @@ pub(super) async fn normalize(
     // 校验刷新是**必需**的：「用户粘了一串东西」与「这串能用」之间没有本地
     // 判据（不像 API Key 有前缀形态）。不校验就落账号，用户会在第一次转发时
     // 才发现串是坏的 —— 那时错误文案混在转发链路里，比在添加页说清楚难查。
-    let credentials = super::login::verify_paste(&payload, input.proxy.as_ref()).await?;
+    let payload = payload.get("inputs").filter(|value| value.is_object()).unwrap_or(&payload);
+    let credentials = super::login::verify_paste(payload, input.proxy.as_ref()).await?;
     let _ = ctx;
     let name = input
         .name
@@ -120,14 +121,11 @@ pub(super) fn account_of(
     }
 }
 
-/// 账号公开视图（界面账号页读的那几个键，与网关
-/// `to_antigravity_public_account` 逐键对应）。
+/// Antigravity 专属的公开字段；账号 id 与 provider 由网关注入。
 pub(super) fn account_view(secret: &Value) -> Value {
     let refresh_token = crate::store::pick(secret, &["refreshToken", "refresh_token"]);
     let access_token = crate::store::pick(secret, &["accessToken", "access_token"]);
     let mut view = serde_json::json!({
-        "id": crate::store::pick(secret, &["id"]),
-        "provider": crate::store::pick(secret, &["provider"]),
         "name": crate::store::pick(secret, &["name"]),
         "userId": crate::store::pick(secret, &["userId", "email"]),
         "email": crate::store::pick(secret, &["email"]),
@@ -137,6 +135,7 @@ pub(super) fn account_view(secret: &Value) -> Value {
         // 按它算尾号会让同一账号每次刷新后显示不同）
         "tokenTail": crate::store::token_tail(&refresh_token),
         "hasRefreshToken": !refresh_token.is_empty(),
+        "refreshTokenLongLived": true,
         "hasAccessToken": !access_token.is_empty(),
         "desktop": false,
         // 有 refreshToken 就算「当前可用」（accessToken 可以由刷新补齐）

@@ -28,8 +28,6 @@ pub mod atomcode;
 pub mod autoclaw;
 #[cfg(feature = "catpaw")]
 pub mod catpaw;
-#[cfg(feature = "chatglm")]
-pub mod chatglm;
 #[cfg(feature = "cline")]
 pub mod cline;
 #[cfg(feature = "commandcode")]
@@ -64,6 +62,12 @@ pub mod trae;
 pub mod workbuddy;
 #[cfg(feature = "zcode")]
 pub mod zcode;
+#[cfg(feature = "doubaowork")]
+pub mod doubaowork;
+#[cfg(feature = "astudio")]
+pub mod astudio;
+#[cfg(feature = "quwork")]
+pub mod quwork;
 
 use agent2api_provider_sdk::BoxProvider;
 
@@ -122,14 +126,19 @@ pub fn registry() -> Vec<BoxProvider> {
         list.push(Box::new(qoder::QODER_INTL));
     }
 
+    // 千问办公与 Qoder 是同一套协议栈，实现共用 `qoder` 模块（见
+    // `qoder/endpoints.rs` 的模块头）；两版同样是两个 provider、两个实例。
+    #[cfg(feature = "qwenwork")]
+    {
+        list.push(Box::new(qoder::QWENWORK_CN));
+        list.push(Box::new(qoder::QWENWORK_INTL));
+    }
+
     #[cfg(feature = "raccoon")]
     list.push(Box::new(raccoon::RaccoonProvider));
 
     #[cfg(feature = "atomcode")]
     list.push(Box::new(atomcode::AtomcodeProvider));
-
-    #[cfg(feature = "chatglm")]
-    list.push(Box::new(chatglm::ChatglmProvider));
 
     // AutoClaw 的两个地区是两个 provider、两个实例（同一份实现按地区参数化）
     #[cfg(feature = "autoclaw")]
@@ -172,6 +181,17 @@ pub fn registry() -> Vec<BoxProvider> {
     list.push(Box::new(codearts::adapter::CODEARTS));
     #[cfg(feature = "antigravity")]
     list.push(Box::new(antigravity::adapter::ANTIGRAVITY));
+    #[cfg(feature = "doubaowork")]
+    list.push(Box::new(doubaowork::DoubaoWorkProvider));
+
+    #[cfg(feature = "kiro")]
+    list.push(Box::new(kiro::KiroProvider));
+
+    #[cfg(feature = "astudio")]
+    list.push(Box::new(astudio::AStudioProvider));
+
+    #[cfg(feature = "quwork")]
+    list.push(Box::new(quwork::QuWorkProvider));
 
     #[cfg(feature = "kiro")]
     {

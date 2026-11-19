@@ -1,8 +1,8 @@
 //! Loomy 模型目录：`GET {集成网关}/api/v1/models`（OpenAI 格式）+ 进程内缓存。
 //!
 //! ── 上游形态（客户端 `electron/model-service.js` 的 `fetchModelsFromProvider`）──
-//! 标准 OpenAI 形态 `{data:[{id, ...}]}`；鉴权是**双头**：`token: <session>` 与
-//! `Authorization: Bearer <session>`。
+//! 标准 OpenAI 形态 `{data:[{id, protocol, ...}]}`；目录带 `protocol` 决定推理走
+//! Chat Completions 或 Anthropic Messages，缺省为 OpenAI。目录查询使用 session。
 //!
 //! 拉取失败时**不编造模型名**：Loomy 官方 imodel 网关没有内置兜底清单
 //! （客户端 `BUILTIN_FALLBACK_MODELS` 为空表），这里如实报失败、保留旧清单。
@@ -135,14 +135,25 @@ fn map_entry(row: &Value) -> Option<Value> {
         .unwrap_or(id);
     let (name, rate) = split_rate_suffix(raw_name);
     let caps = row.get("capabilities").and_then(Value::as_object);
-    let tool_call = caps_bool(caps, "function_calling") || caps.is_none();
-    let reasoning = caps_bool(caps, "reasoning") || is_reasoning_model(id);
+    let image_generation = row.get("type").and_then(Value::as_str) == Some("image")
+        || row.get("output_modalities").or_else(|| row.pointer("/capabilities/output_modalities"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("image")));
+    let tool_call = !image_generation && (caps_bool(caps, "function_calling") || caps.is_none());
+    let reasoning = !image_generation && (caps_bool(caps, "reasoning") || is_reasoning_model(id));
     let mut item = json!({
         "id": id,
         "name": name,
+        "protocol": normalize_protocol(row.get("protocol").and_then(Value::as_str)),
         "supportsToolCall": tool_call,
         "supportsReasoning": reasoning,
     });
+    if image_generation {
+        item["kind"] = json!("image");
+        item["output_modalities"] = json!(["image"]);
+        item["supports_image_editing"] = json!(true);
+        item["isDefault"] = json!(false);
+    }
     if caps_bool(caps, "vision") || caps_modal(caps, "image") {
         if let Some(object) = item.as_object_mut() {
             object.insert("supportsImages".to_string(), Value::Bool(true));
@@ -208,6 +219,23 @@ pub fn list() -> Vec<Value> {
     with_state(|slot| slot.as_ref().map(|state| state.models.clone()).unwrap_or_default())
 }
 
+fn normalize_protocol(value: Option<&str>) -> &'static str {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("anthropic" | "anthropic_messages") => "anthropic",
+        _ => "openai",
+    }
+}
+
+pub(super) fn protocol(model: &str) -> Option<String> {
+    with_state(|slot| {
+        slot.as_ref()?.models.iter().find_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?;
+            id.eq_ignore_ascii_case(model.trim())
+                .then(|| normalize_protocol(item.get("protocol").and_then(Value::as_str)).to_string())
+        })
+    })
+}
+
 /// 当前清单 + 元数据。
 pub fn catalog() -> proto::ModelList {
     with_state(|slot| match slot.as_ref() {
@@ -221,29 +249,6 @@ pub fn catalog() -> proto::ModelList {
         },
         None => proto::ModelList::default(),
     })
-}
-
-/// 该模型 id 在上游目录里声明的图片输入能力。
-///
-/// `Some(true|false)` = 目录里有这条记录（能力位缺失按 `false` 读）；
-/// `None` = 查不到（目录还没刷出来 / 模型已下线）。
-pub fn declared_image_input(model: &str) -> Option<bool> {
-    let wire = model.trim();
-    if wire.is_empty() {
-        return None;
-    }
-    list()
-        .iter()
-        .find(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id.eq_ignore_ascii_case(wire))
-        })
-        .map(|item| {
-            item.get("supportsImages")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
 }
 
 /// 拉一次模型目录并落地（内存缓存）。
@@ -272,6 +277,14 @@ pub async fn refresh(
             Ok(payload) => payload,
             Err(error) => return proto::RefreshOutcome::failed(error),
         };
+    let code = client::business_code(&payload);
+    if !code.is_empty() && code != client::SUCCESS_CODE {
+        return proto::RefreshOutcome::failed(if client::is_auth_error_code(&code) {
+            "Loomy 登录态已失效，无法查询模型目录（请重新登录）".to_string()
+        } else {
+            format!("Loomy 模型目录查询失败（code={code}）：{}", client::upstream_message(&payload))
+        });
+    }
     let models = parse_models(&payload);
     if models.is_empty() {
         return proto::RefreshOutcome::failed("Loomy 模型目录为空或格式不认识（保留现有清单）");

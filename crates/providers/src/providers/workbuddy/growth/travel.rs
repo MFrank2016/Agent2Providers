@@ -306,7 +306,7 @@ pub struct AccountTravelReport {
 /// 整条吞掉 —— 但定时任务只把「有动作 / 有失败」的写进摘要，避免日志刷屏
 /// （见 `core::growth_scheduler`）。
 pub async fn run_for_accounts(
-    _ctx: &agent2api_provider_sdk::PluginCtx,
+    ctx: &agent2api_provider_sdk::PluginCtx,
     accounts: &[serde_json::Value],
 ) -> Vec<AccountTravelReport> {
     /// 账号间错峰（毫秒）：参考项目 `travelAccountDelay` 同口径。
@@ -337,14 +337,25 @@ pub async fn run_for_accounts(
         // 账号记录是扁平 secret → 折成会话形状（与网关 `session_from_record`
         // 同形），再交给 `from_session`。
         let session = super::super::session_of_record(account, super::super::Region::Cn);
-        let Some(growth_account) = GrowthAccount::from_session(&session) else {
+        let Some(mut growth_account) = GrowthAccount::from_session(&session) else {
             continue;
         };
+        growth_account.ctx = Some(ctx.clone());
         if !first {
             tokio::time::sleep(std::time::Duration::from_millis(ACCOUNT_GAP_MS)).await;
         }
         first = false;
-        let report = run_once(&growth_account).await;
+        let route = match agent2api_provider_sdk::egress::for_account(ctx, super::super::Region::Cn.provider_id(), id).await {
+            Ok(route) => route,
+            Err(error) => {
+                reports.push(AccountTravelReport {
+                    account_id: id.to_string(), name, outcome: "failed",
+                    message: format!("账号出口准备失败：{error}"), credit: 0,
+                });
+                continue;
+            }
+        };
+        let report = agent2api_provider_sdk::egress::scope(Some(route), run_once(&growth_account)).await;
         reports.push(AccountTravelReport {
             account_id: id.to_string(),
             name,

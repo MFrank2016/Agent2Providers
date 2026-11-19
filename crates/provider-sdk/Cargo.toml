@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-provider-sdk"
-version = "0.2.1"
+version = "0.2.2-beta.2"
 description = "Agent2API 提供商插件 SDK：实现 Provider trait 即可被网关加载"
 authors = ["Agent2API"]
 edition = "2021"
@@ -17,4 +17,6 @@ homepage = "https://github.com/aimod-cc/Agent2API"
 agent2api-provider-protocol = { path = "../provider-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+url = "2"
+percent-encoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std"] }
